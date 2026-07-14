@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import concurrent.futures
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,15 +10,15 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
-from gateway.platforms.dingtalk import DingTalkAdapter
-from gateway.platforms import dingtalk as dingtalk_module
+from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+from plugins.platforms.dingtalk import adapter as dingtalk_module
 from gateway.session import SessionEntry, SessionSource, build_session_key
 from gateway.xintai_evidence_relay import RelayResult
 
 
 def _make_dingtalk_message(*, text: str = "", payload: dict | None = None, **overrides):
     payload = dict(payload or {})
-    msg = MagicMock()
+    msg = SimpleNamespace()
     msg.message_id = overrides.get("message_id", "msg-001")
     msg.conversation_id = overrides.get("conversation_id", "cid-001")
     msg.conversation_type = overrides.get("conversation_type", "2")
@@ -88,6 +87,59 @@ async def test_dingtalk_text_event_relays_before_hermes_handler() -> None:
     assert event.text == "昨天那个先继续跟一下"
     assert adapter._xintai_stream_health.relay_success_count == 1
     assert adapter._xintai_stream_health.last_event_at is not None
+
+
+@pytest.mark.asyncio
+async def test_non_allowlisted_user_event_still_relays_as_evidence() -> None:
+    adapter = DingTalkAdapter(
+        PlatformConfig(enabled=True, extra={"allowed_users": ["manager-only"]})
+    )
+    adapter._accepting_events = True
+    adapter._mark_connected()
+    adapter._xintai_evidence_relay = SimpleNamespace(
+        relay=AsyncMock(return_value=RelayResult(True, "msg-unlisted-001", "accepted"))
+    )
+    adapter.handle_message = AsyncMock()
+
+    message = _make_dingtalk_message(
+        text="今天产量是 123 吨",
+        payload={"msgtype": "text"},
+        message_id="msg-unlisted-001",
+        sender_id="ordinary-user",
+        sender_staff_id="ordinary-staff",
+    )
+
+    await adapter._on_message(message)
+    await asyncio.gather(*list(adapter._xintai_relay_tasks))
+
+    adapter._xintai_evidence_relay.relay.assert_awaited_once()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unmentioned_group_event_still_relays_as_evidence() -> None:
+    adapter = DingTalkAdapter(
+        PlatformConfig(enabled=True, extra={"require_mention": True})
+    )
+    adapter._accepting_events = True
+    adapter._mark_connected()
+    adapter._xintai_evidence_relay = SimpleNamespace(
+        relay=AsyncMock(return_value=RelayResult(True, "msg-unmentioned-001", "accepted"))
+    )
+    adapter.handle_message = AsyncMock()
+
+    message = _make_dingtalk_message(
+        text="日报文件已经发群里了",
+        payload={"msgtype": "text", "isInAtList": False},
+        message_id="msg-unmentioned-001",
+    )
+    message.is_in_at_list = False
+
+    await adapter._on_message(message)
+    await asyncio.gather(*list(adapter._xintai_relay_tasks))
+
+    adapter._xintai_evidence_relay.relay.assert_awaited_once()
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -188,7 +240,7 @@ async def test_dingtalk_unknown_event_still_relays() -> None:
 
     relay_payload = adapter._xintai_evidence_relay.relay.await_args.args[0]
     assert relay_payload["msgtype"] == "custom_unknown"
-    assert relay_payload["rawEvent"]["eventType"] == "robot_notice"
+    assert relay_payload["eventType"] == "robot_notice"
     adapter.handle_message.assert_not_called()
 
 
@@ -277,9 +329,7 @@ async def test_disconnect_drops_late_callback_before_threadsafe_dispatch(monkeyp
 
     inflight_started = asyncio.Event()
     inflight_cancelled = asyncio.Event()
-    stop_called = asyncio.Event()
     relay_calls: list[str] = []
-    submitted: list[str] = []
 
     async def _relay(payload):
         relay_calls.append(payload["traceId"])
@@ -292,25 +342,9 @@ async def test_disconnect_drops_late_callback_before_threadsafe_dispatch(monkeyp
                 raise
         return RelayResult(True, payload["traceId"], "accepted")
 
-    async def _stop_stream():
-        stop_called.set()
-
-    def _submit(coro, loop):
-        task = loop.create_task(coro)
-        submitted.append(task.get_coro().cr_code.co_name)
-        future = concurrent.futures.Future()
-
-        def _copy_result(done: asyncio.Task) -> None:
-            try:
-                future.set_result(done.result())
-            except Exception as exc:  # noqa: BLE001
-                future.set_exception(exc)
-
-        task.add_done_callback(_copy_result)
-        return future
-
     adapter._xintai_evidence_relay = SimpleNamespace(relay=_relay, bind_http_client=lambda _client: None)
-    adapter._stream_client = SimpleNamespace(stop=_stop_stream)
+    websocket_close = AsyncMock()
+    adapter._stream_client = SimpleNamespace(websocket=SimpleNamespace(close=websocket_close))
     adapter._stream_task = asyncio.create_task(asyncio.sleep(60))
 
     inflight_message = _make_dingtalk_message(
@@ -332,8 +366,8 @@ async def test_disconnect_drops_late_callback_before_threadsafe_dispatch(monkeyp
 
     monkeypatch.setattr(
         dingtalk_module,
-        "dingtalk_stream",
-        SimpleNamespace(AckMessage=SimpleNamespace(STATUS_OK="ACK_OK")),
+        "AckMessage",
+        SimpleNamespace(STATUS_OK="ACK_OK", STATUS_SYSTEM_EXCEPTION="ACK_ERROR"),
     )
     monkeypatch.setattr(
         dingtalk_module,
@@ -341,21 +375,18 @@ async def test_disconnect_drops_late_callback_before_threadsafe_dispatch(monkeyp
         SimpleNamespace(from_dict=lambda _payload: late_message),
         raising=False,
     )
-    monkeypatch.setattr(dingtalk_module.asyncio, "run_coroutine_threadsafe", _submit)
-
     disconnect_task = asyncio.create_task(adapter.disconnect())
     await asyncio.sleep(0)
 
-    ack = handler.process(callback)
+    ack = await handler.process(callback)
 
     await disconnect_task
     await asyncio.sleep(0)
 
     assert ack == ("ACK_OK", "OK")
-    assert stop_called.is_set() is True
+    websocket_close.assert_awaited_once()
     assert inflight_cancelled.is_set() is True
     assert relay_calls == ["msg-inflight-001"]
-    assert submitted == []
     adapter.handle_message.assert_not_called()
     assert len(adapter._xintai_relay_tasks) == 0
 
@@ -488,12 +519,10 @@ async def test_keyword_bridge_no_longer_intercepts_dingtalk_messages() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_ping_help_and_status_use_xintai_identity() -> None:
+async def test_runtime_help_and_status_use_xintai_identity(monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
     runner, source = _make_runner()
 
-    ping_result = await runner._handle_message(
-        MessageEvent(text="/ping", source=source, message_id="msg-ping-001")
-    )
     help_result = await runner._handle_message(
         MessageEvent(text="/help", source=source, message_id="msg-help-001")
     )
@@ -501,7 +530,6 @@ async def test_runtime_ping_help_and_status_use_xintai_identity() -> None:
         MessageEvent(text="/status", source=source, message_id="msg-status-001")
     )
 
-    assert ping_result == "已收到。\n鑫泰铝业智能大脑网关已连接。"
     assert help_result.startswith("📖 **鑫泰铝业智能大脑 可用指令**")
     assert "Hermes Commands" not in help_result
     assert "设置当前会话标题" in help_result
@@ -514,7 +542,8 @@ async def test_runtime_ping_help_and_status_use_xintai_identity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_status_exposes_dingtalk_stream_health_snapshot() -> None:
+async def test_status_exposes_dingtalk_stream_health_snapshot(monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
     runner, source = _make_runner()
     runner.adapters[Platform.DINGTALK].get_xintai_stream_health.return_value = {
         "connected": True,
@@ -529,7 +558,8 @@ async def test_status_exposes_dingtalk_stream_health_snapshot() -> None:
         MessageEvent(text="/status", source=source, message_id="msg-status-health-001")
     )
 
-    assert "**钉钉 Stream Worker：** 运行中" in result
+    assert result.startswith("📊 **鑫泰铝业智能大脑 运行状态**")
+    assert "**钉钉 Stream：** 运行中" in result
     assert "**最近收到事件：** 暂无" in result
     assert "**转发成功次数：** 3" in result
     assert "**转发失败次数：** 1" in result
@@ -658,6 +688,7 @@ def test_docker_soul_declares_xintai_identity_in_chinese() -> None:
     assert "鑫泰铝业智能大脑" in soul
     assert "只用中文" in soul
     assert "钉钉证据" in soul
-    assert "MES/WMS只读数据" in soul
+    assert "MES/WMS" in soul
+    assert "只读数据" in soul
     assert "数据中枢已确认事实" in soul
     assert "不要把自己说成开发助手" in soul

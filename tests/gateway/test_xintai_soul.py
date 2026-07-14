@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -81,6 +82,7 @@ async def test_start_gateway_syncs_runtime_soul_before_runner(monkeypatch, tmp_p
             self.config = config
             self.should_exit_cleanly = True
             self.exit_reason = None
+            self.exit_code = None
             self.adapters = {}
 
         async def start(self):
@@ -91,7 +93,7 @@ async def test_start_gateway_syncs_runtime_soul_before_runner(monkeypatch, tmp_p
 
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
     monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
-    monkeypatch.setattr("gateway.run.sync_xintai_runtime_soul", lambda: calls.append("sync"))
+    monkeypatch.setattr("gateway.xintai_soul.sync_xintai_runtime_soul", lambda: calls.append("sync"))
     monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
     monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
     monkeypatch.setattr("gateway.run.GatewayRunner", _CleanExitRunner)
@@ -102,3 +104,4 @@ async def test_start_gateway_syncs_runtime_soul_before_runner(monkeypatch, tmp_p
 
     assert ok is True
     assert calls == ["sync"]
+    assert os.environ["HERMES_LANGUAGE"] == "zh"
