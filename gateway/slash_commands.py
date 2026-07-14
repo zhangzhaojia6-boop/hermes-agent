@@ -54,6 +54,54 @@ logger = logging.getLogger("gateway.run")
 # its worker thread. (#35994)
 _RESET_CLEANUP_TIMEOUT_S = 30.0
 
+_XINTAI_HELP_DESCRIPTIONS_ZH = {
+    "new": "新开一个会话",
+    "retry": "重试上一条消息",
+    "undo": "撤回上一轮对话",
+    "title": "设置当前会话标题",
+    "branch": "从当前会话分出一条新讨论线",
+    "compress": "压缩当前会话上下文",
+    "rollback": "查看或恢复文件检查点",
+    "stop": "停止当前任务",
+    "approve": "同意待确认操作",
+    "deny": "拒绝待确认操作",
+    "background": "把问题放到后台处理",
+    "btw": "基于当前上下文临时追问",
+    "queue": "把问题排到当前任务之后",
+    "status": "查看当前会话和钉钉链路状态",
+    "profile": "查看当前配置和目录",
+    "sethome": "把当前聊天设为回传频道",
+    "resume": "恢复已命名会话",
+    "model": "切换当前会话使用的模型",
+    "provider": "查看可用模型提供方",
+    "personality": "切换预设人格",
+    "yolo": "切换免审批模式",
+    "reasoning": "管理推理强度和展示方式",
+    "fast": "切换快慢模式",
+    "voice": "切换语音模式",
+    "reload-mcp": "重新加载 MCP 服务",
+    "commands": "分页查看全部指令和技能",
+    "help": "查看可用指令说明",
+    "restart": "排空任务后重启网关",
+    "usage": "查看当前会话用量",
+    "insights": "查看最近使用分析",
+    "update": "更新当前智能大脑程序",
+}
+
+
+def _xintai_gateway_help_lines_zh() -> list[str]:
+    from hermes_cli.commands import COMMAND_REGISTRY, _is_gateway_available, _resolve_config_gates
+
+    overrides = _resolve_config_gates()
+    lines: list[str] = []
+    for command in COMMAND_REGISTRY:
+        if not _is_gateway_available(command, overrides):
+            continue
+        args = f" {command.args_hint}" if command.args_hint else ""
+        description = _XINTAI_HELP_DESCRIPTIONS_ZH.get(command.name, "查看此功能")
+        lines.append(f"`/{command.name}{args}` - {description}")
+    return lines
+
 
 def _model_switch_skew_guard() -> Optional[str]:
     """Refuse a model switch when the gateway is running stale code.
@@ -665,6 +713,24 @@ class GatewaySlashCommandsMixin:
             "",
             t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
         ])
+
+        if source.platform == Platform.DINGTALK:
+            dingtalk_adapter = self.adapters.get(Platform.DINGTALK)
+            if dingtalk_adapter and hasattr(dingtalk_adapter, "get_xintai_stream_health"):
+                snapshot = dingtalk_adapter.get_xintai_stream_health() or {}
+                last_event = snapshot.get("last_event_at")
+                if isinstance(last_event, datetime):
+                    last_event_text = last_event.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    last_event_text = str(last_event or "暂无")
+                lines.extend([
+                    "",
+                    f"**钉钉 Stream：** {'运行中' if snapshot.get('stream_running') else '未运行'}",
+                    f"**最近收到事件：** {last_event_text}",
+                    f"**转发成功次数：** {int(snapshot.get('relay_success_count', 0) or 0)}",
+                    f"**转发失败次数：** {int(snapshot.get('relay_failure_count', 0) or 0)}",
+                    f"**最近错误：** {snapshot.get('last_error') or '无'}",
+                ])
 
         return "\n".join(lines)
 
@@ -1320,10 +1386,9 @@ class GatewaySlashCommandsMixin:
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
         from gateway.run import _telegramize_command_mentions
-        from hermes_cli.commands import gateway_help_lines
         lines = [
-            t("gateway.help.header"),
-            *gateway_help_lines(),
+            t("gateway.help.header", lang="zh"),
+            *_xintai_gateway_help_lines_zh(),
         ]
         try:
             from agent.skill_commands import get_skill_commands
@@ -1345,7 +1410,6 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_commands_command(self, event: MessageEvent) -> str:
         from gateway.run import _telegramize_command_mentions
-        from hermes_cli.commands import gateway_help_lines
 
         raw_args = event.get_command_args().strip()
         if raw_args:
@@ -1357,7 +1421,7 @@ class GatewaySlashCommandsMixin:
             requested_page = 1
 
         # Build combined entry list: built-in commands + skill commands
-        entries = list(gateway_help_lines())
+        entries = _xintai_gateway_help_lines_zh()
         try:
             from agent.skill_commands import get_skill_commands
             skill_cmds = get_skill_commands()

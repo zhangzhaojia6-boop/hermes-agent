@@ -8,3 +8,7 @@ web/package-lock.json linguist-generated=true
 Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
+
+# Keep Python and Markdown files stable across Windows development and Linux production.
+*.py text eol=lf
+*.md text eol=lf

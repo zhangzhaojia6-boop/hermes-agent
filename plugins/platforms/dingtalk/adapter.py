@@ -102,6 +102,12 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.xintai_evidence_relay import (
+    XintaiEvidenceRelay,
+    build_dingtalk_fallback_identity,
+)
+from gateway.xintai_soul import XINTAI_RUNTIME_NAME
+from gateway.xintai_stream_health import XintaiStreamHealth
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +242,11 @@ class DingTalkAdapter(BasePlatformAdapter):
         # Track fire-and-forget emoji/reaction coroutines so Python's GC
         # doesn't drop them mid-flight, and we can cancel them on disconnect.
         self._bg_tasks: Set[asyncio.Task] = set()
+        self._xintai_evidence_relay = XintaiEvidenceRelay()
+        self._xintai_stream_health = XintaiStreamHealth()
+        self._xintai_relay_tasks: Set[asyncio.Task] = set()
+        self._accepting_events = False
+        self._shutting_down = False
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -258,10 +269,11 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
             return False
 
+        local_http_client: Optional["httpx.AsyncClient"] = None
         try:
             # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451).
             from gateway.platforms._http_client_limits import platform_httpx_limits
-            self._http_client = httpx.AsyncClient(
+            local_http_client = httpx.AsyncClient(
                 timeout=30.0, limits=platform_httpx_limits(),
             )
 
@@ -297,11 +309,24 @@ class DingTalkAdapter(BasePlatformAdapter):
                 dingtalk_stream.ChatbotMessage.TOPIC, handler
             )
 
+            self._http_client = local_http_client
+            self._xintai_evidence_relay.bind_http_client(local_http_client)
+            self._accepting_events = True
+            self._shutting_down = False
             self._stream_task = asyncio.create_task(self._run_stream())
             self._mark_connected()
+            self._xintai_stream_health.set_stream_running(True)
             logger.info("[%s] Connected via Stream Mode", self.name)
             return True
         except Exception as e:
+            self._accepting_events = False
+            self._stream_task = None
+            self._stream_client = None
+            self._http_client = None
+            self._xintai_evidence_relay.bind_http_client(None)
+            self._xintai_stream_health.set_stream_running(False)
+            if local_http_client is not None:
+                await local_http_client.aclose()
             logger.error("[%s] Failed to connect: %s", self.name, e)
             return False
 
@@ -310,14 +335,19 @@ class DingTalkAdapter(BasePlatformAdapter):
         backoff_idx = 0
         while self._running:
             try:
+                self._xintai_stream_health.set_stream_running(True)
                 logger.debug("[%s] Starting stream client...", self.name)
                 await self._stream_client.start()
             except asyncio.CancelledError:
+                self._xintai_stream_health.set_stream_running(False)
                 return
             except Exception as e:
+                self._xintai_stream_health.set_stream_running(False)
                 if not self._running:
                     return
                 logger.warning("[%s] Stream client error: %s", self.name, e)
+            else:
+                self._xintai_stream_health.set_stream_running(False)
 
             if not self._running:
                 return
@@ -329,6 +359,8 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from DingTalk."""
+        self._accepting_events = False
+        self._shutting_down = True
         self._running = False
         self._mark_disconnected()
 
@@ -365,6 +397,8 @@ class DingTalkAdapter(BasePlatformAdapter):
             await asyncio.gather(*self._bg_tasks, return_exceptions=True)
             self._bg_tasks.clear()
 
+        await self._cancel_xintai_relay_tasks()
+
         # Finalize any open streaming cards before the HTTP client closes so
         # they don't stay stuck in streaming state on DingTalk's UI after
         # a gateway restart.  _close_streaming_siblings handles its own
@@ -381,6 +415,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
+        self._xintai_evidence_relay.bind_http_client(None)
 
         self._stream_client = None
         self._session_webhooks.clear()
@@ -388,6 +423,8 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._streaming_cards.clear()
         self._done_emoji_fired.clear()
         self._dedup.clear()
+        self._xintai_stream_health.set_stream_running(False)
+        self._shutting_down = False
         logger.info("[%s] Disconnected", self.name)
 
     # -- Group gating --------------------------------------------------------
@@ -591,15 +628,166 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     # -- Inbound message processing -----------------------------------------
 
+    def _resolve_message_id(self, message: "ChatbotMessage") -> str:
+        native_id = str(getattr(message, "message_id", "") or "").strip()
+        if native_id:
+            return native_id
+
+        payload = dict(getattr(message, "data", {}) or {})
+        payload.update(
+            {
+                "conversationId": getattr(message, "conversation_id", "") or payload.get("conversationId"),
+                "conversationType": getattr(message, "conversation_type", "") or payload.get("conversationType"),
+                "senderId": getattr(message, "sender_id", "") or payload.get("senderId"),
+                "senderStaffId": getattr(message, "sender_staff_id", "") or payload.get("senderStaffId"),
+                "senderUnionId": getattr(message, "sender_union_id", "") or payload.get("senderUnionId"),
+                "senderNick": getattr(message, "sender_nick", "") or payload.get("senderNick"),
+                "conversationTitle": getattr(message, "conversation_title", "") or payload.get("conversationTitle"),
+                "createAt": getattr(message, "create_at", "") or payload.get("createAt"),
+            }
+        )
+        text = self._extract_text(message)
+        if text:
+            payload["text"] = {"content": text}
+        return build_dingtalk_fallback_identity(payload)
+
+    def _build_xintai_payload(
+        self,
+        message: "ChatbotMessage",
+        *,
+        text: str,
+        message_id: str,
+        timestamp: datetime,
+    ) -> Dict[str, Any]:
+        payload = dict(getattr(message, "data", {}) or {})
+        payload.update(
+            {
+                "messageId": message_id,
+                "conversationId": getattr(message, "conversation_id", "") or payload.get("conversationId"),
+                "conversationType": getattr(message, "conversation_type", "") or payload.get("conversationType"),
+                "senderId": getattr(message, "sender_id", "") or payload.get("senderId"),
+                "senderStaffId": getattr(message, "sender_staff_id", "") or payload.get("senderStaffId"),
+                "senderUnionId": getattr(message, "sender_union_id", "") or payload.get("senderUnionId"),
+                "senderNick": getattr(message, "sender_nick", "") or payload.get("senderNick"),
+                "conversationTitle": getattr(message, "conversation_title", "") or payload.get("conversationTitle"),
+                "createAt": getattr(message, "create_at", "") or payload.get("createAt") or str(int(timestamp.timestamp() * 1000)),
+            }
+        )
+        event_time = str(
+            payload.get("messageTime")
+            or payload.get("msgCreateTime")
+            or payload.get("createTime")
+            or payload.get("eventTime")
+            or payload.get("createAt")
+            or str(int(timestamp.timestamp() * 1000))
+        ).strip()
+        if text:
+            payload["text"] = {"content": text}
+        payload.setdefault("msgtype", payload.get("messageType") or "text")
+        payload["traceId"] = message_id
+        payload["receivedAt"] = payload.get("receivedAt") or timestamp.astimezone(timezone.utc).isoformat()
+        payload["received_at"] = payload.get("received_at") or timestamp.astimezone(timezone.utc).isoformat()
+        for key in ("messageTime", "msgCreateTime", "createTime", "eventTime"):
+            payload[key] = payload.get(key) or event_time
+        return payload
+
+    def get_xintai_stream_health(self) -> Dict[str, Any]:
+        return self._xintai_stream_health.snapshot()
+
+    def _schedule_xintai_relay(self, payload: Dict[str, Any]) -> None:
+        if not self._can_accept_events():
+            return
+        task = asyncio.create_task(self._run_xintai_relay(payload))
+        self._xintai_relay_tasks.add(task)
+        task.add_done_callback(self._on_xintai_relay_done)
+
+    async def _run_xintai_relay(self, payload: Dict[str, Any]) -> None:
+        try:
+            result = await self._xintai_evidence_relay.relay(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+            self._xintai_stream_health.record_relay(
+                accepted=False,
+                error=error,
+                category="exception",
+            )
+            logger.warning(
+                "[%s] Xintai relay failed trace_id=%s error=%s",
+                self.name,
+                payload.get("traceId", ""),
+                error,
+            )
+            return
+
+        self._xintai_stream_health.record_relay(
+            accepted=result.accepted,
+            error=result.error,
+            category=result.category,
+        )
+        if not result.accepted and result.category != "disabled":
+            logger.warning(
+                "[%s] Xintai relay rejected trace_id=%s category=%s error=%s",
+                self.name,
+                result.trace_id,
+                result.category,
+                result.error or "",
+            )
+
+    def _on_xintai_relay_done(self, task: asyncio.Task) -> None:
+        self._xintai_relay_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            logger.exception("[%s] Unhandled Xintai relay task error", self.name)
+
+    async def _cancel_xintai_relay_tasks(self) -> None:
+        tasks = [task for task in self._xintai_relay_tasks if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._xintai_relay_tasks.clear()
+
+    def _can_accept_events(self) -> bool:
+        return self._running and self._accepting_events and not self._shutting_down
+
     async def _on_message(
         self,
         message: "ChatbotMessage",
     ) -> None:
         """Process an incoming DingTalk chatbot message."""
-        msg_id = getattr(message, "message_id", None) or uuid.uuid4().hex
+        if not self._can_accept_events():
+            return
+
+        text = self._extract_text(message) or ""
+        create_at = getattr(message, "create_at", None)
+        try:
+            timestamp = (
+                datetime.fromtimestamp(int(create_at) / 1000, tz=timezone.utc)
+                if create_at
+                else datetime.now(tz=timezone.utc)
+            )
+        except (ValueError, OSError, TypeError):
+            timestamp = datetime.now(tz=timezone.utc)
+
+        msg_id = self._resolve_message_id(message)
         if self._dedup.is_duplicate(msg_id):
             logger.debug("[%s] Duplicate message %s, skipping", self.name, msg_id)
             return
+
+        self._xintai_stream_health.record_event(timestamp)
+        self._schedule_xintai_relay(
+            self._build_xintai_payload(
+                message,
+                text=text,
+                message_id=msg_id,
+                timestamp=timestamp,
+            )
+        )
 
         # Chat context
         conversation_id = getattr(message, "conversation_id", "") or ""
@@ -624,8 +812,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         # We need the message text for regex wake-word matching; extract it
         # early but don't consume the rest of the pipeline until after the
         # gate decides whether to process.
-        _early_text = self._extract_text(message) or ""
-        if not self._should_process_message(message, _early_text, is_group, chat_id):
+        if not self._should_process_message(message, text, is_group, chat_id):
             logger.debug(
                 "[%s] Dropping group message that failed mention gate message_id=%s chat_id=%s",
                 self.name, msg_id, chat_id,
@@ -659,9 +846,6 @@ class DingTalkAdapter(BasePlatformAdapter):
         # Resolve media download codes to URLs so vision tools can use them
         await self._resolve_media_codes(message)
 
-        # Extract text content
-        text = self._extract_text(message)
-
         # Determine message type and build media list
         msg_type, media_urls, media_types = self._extract_media(message)
 
@@ -677,17 +861,6 @@ class DingTalkAdapter(BasePlatformAdapter):
             user_name=sender_nick,
             user_id_alt=sender_staff_id if sender_staff_id else None,
         )
-
-        # Parse timestamp
-        create_at = getattr(message, "create_at", None)
-        try:
-            timestamp = (
-                datetime.fromtimestamp(int(create_at) / 1000, tz=timezone.utc)
-                if create_at
-                else datetime.now(tz=timezone.utc)
-            )
-        except (ValueError, OSError, TypeError):
-            timestamp = datetime.now(tz=timezone.utc)
 
         event = MessageEvent(
             text=text,
@@ -905,7 +1078,7 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         payload = {
             "msgtype": "markdown",
-            "markdown": {"title": "Hermes", "text": normalized},
+            "markdown": {"title": XINTAI_RUNTIME_NAME, "text": normalized},
         }
 
         try:
@@ -1443,6 +1616,9 @@ class _IncomingHandler(
         method returns the ACK immediately — blocking here would prevent the
         SDK from sending heartbeats, eventually causing a disconnect.
         """
+        if not self._adapter._can_accept_events():
+            return AckMessage.STATUS_OK, "OK"
+
         try:
             # CallbackMessage.data is a dict containing the raw DingTalk payload
             data = message.data
@@ -1451,6 +1627,8 @@ class _IncomingHandler(
 
             # Parse dict into ChatbotMessage using SDK's from_dict
             chatbot_msg = ChatbotMessage.from_dict(data)
+            if isinstance(data, dict):
+                chatbot_msg.data = dict(data)
 
             # Ensure session_webhook is populated even if the SDK's
             # from_dict() did not map it (field name mismatch across

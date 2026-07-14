@@ -249,7 +249,7 @@ class TestSend:
         assert call_args[0][0] == "https://dingtalk.example/webhook"
         payload = call_args[1]["json"]
         assert payload["msgtype"] == "markdown"
-        assert payload["markdown"]["title"] == "Hermes"
+        assert payload["markdown"]["title"] == "鑫泰铝业智能大脑"
         assert payload["markdown"]["text"] == "Hello!"
 
     @pytest.mark.asyncio
@@ -793,18 +793,19 @@ class TestIncomingHandlerProcess:
         from plugins.platforms.dingtalk.adapter import _IncomingHandler, DingTalkAdapter
 
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._accepting_events = True
         adapter._on_message = AsyncMock()
         handler = _IncomingHandler(adapter, asyncio.get_running_loop())
 
-        callback = MagicMock()
-        callback.data = {
+        callback = SimpleNamespace(data={
             "msgtype": "text",
             "text": {"content": "hello"},
             "senderId": "user1",
             "conversationId": "conv1",
             "sessionWebhook": "https://oapi.dingtalk.com/robot/sendBySession?session=abc",
             "msgId": "msg-001",
-        }
+        })
 
         result = await handler.process(callback)
         # Should return ACK immediately (STATUS_OK = 200)
@@ -826,19 +827,20 @@ class TestIncomingHandlerProcess:
         from plugins.platforms.dingtalk.adapter import _IncomingHandler, DingTalkAdapter
 
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._accepting_events = True
         adapter._on_message = AsyncMock()
         handler = _IncomingHandler(adapter, asyncio.get_running_loop())
 
-        callback = MagicMock()
         # Use a key that from_dict might not recognise in some SDK versions
-        callback.data = {
+        callback = SimpleNamespace(data={
             "msgtype": "text",
             "text": {"content": "hi"},
             "senderId": "user2",
             "conversationId": "conv2",
             "session_webhook": "https://oapi.dingtalk.com/robot/sendBySession?session=def",
             "msgId": "msg-002",
-        }
+        })
 
         await handler.process(callback)
         await asyncio.sleep(0.05)
@@ -861,18 +863,19 @@ class TestIncomingHandlerProcess:
             await processing_gate.wait()  # Block until we release
 
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._accepting_events = True
         adapter._on_message = slow_on_message
         handler = _IncomingHandler(adapter, asyncio.get_running_loop())
 
-        callback = MagicMock()
-        callback.data = {
+        callback = SimpleNamespace(data={
             "msgtype": "text",
             "text": {"content": "test"},
             "senderId": "u",
             "conversationId": "c",
             "sessionWebhook": "https://oapi.dingtalk.com/x",
             "msgId": "m",
-        }
+        })
 
         # process() should return immediately even though _on_message blocks
         result = await handler.process(callback)

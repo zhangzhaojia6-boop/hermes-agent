@@ -143,7 +143,7 @@ gateway:
     set:                   "⊙ 目标已设置（{budget} 轮预算）：{goal}\n我将持续工作直到目标完成、你暂停/清除它，或预算耗尽。\n控制命令：/goal status · /goal pause · /goal resume · /goal clear"
 
   help:
-    header:                "📖 **Hermes 命令**\n"
+    header:                "📖 **鑫泰铝业智能大脑 可用指令**\n"
     skill_header:          "\n⚡ **技能命令**（{count} 个活跃）："
     more_use_commands:     "\n... 还有 {count} 个。使用 `/commands` 查看完整分页列表。"
 
@@ -275,7 +275,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     success:               "✅ 主频道已设置为 **{name}**（ID：{chat_id}）。\n定时任务和跨平台消息将发送到此处。"
 
   status:
-    header:                "📊 **Hermes 网关状态**"
+    header:                "📊 **鑫泰铝业智能大脑 运行状态**"
     matrix_scope_header:   "**Matrix scope:**"
     matrix_scope_room:     "  room: {room}"
     matrix_scope_room_id:  "  room_id: {room_id}"
@@ -286,12 +286,12 @@ Future messages in this room will use that transcript until `/reset` or another 
     title:                 "**标题：** {title}"
     created:               "**创建时间：** {timestamp}"
     last_activity:         "**最近活动：** {timestamp}"
-    model:                 "**Model:** `{model}`"
-    model_provider:        "**Model:** `{model}` ({provider})"
-    context:               "**Context:** {used} / {total} ({pct}%)"
-    context_used:          "**Context:** ~{used} tokens"
+    model:                 "**模型：** `{model}`"
+    model_provider:        "**模型：** `{model}`（{provider}）"
+    context:               "**上下文：** {used} / {total}（{pct}%）"
+    context_used:          "**上下文：** 约 {used} Token"
     tokens:                "**Token 数：** {tokens}"
-    agent_running:         "**代理运行中：** {state}"
+    agent_running:         "**智能大脑运行中：** {state}"
     state_yes:             "是 ⚡"
     state_no:              "否"
     queued:                "**排队的后续：** {count}"

@@ -20725,6 +20725,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception:
         pass
 
+    try:
+        os.environ["HERMES_LANGUAGE"] = "zh"
+        from gateway.xintai_soul import sync_xintai_runtime_soul
+
+        sync_xintai_runtime_soul()
+    except Exception as exc:
+        logger.warning("Failed to sync Xintai runtime identity: %s", exc)
+
     # Centralized logging — agent.log (INFO+), errors.log (WARNING+),
     # and gateway.log (INFO+, gateway-component records only).
     # Idempotent, so repeated calls from AIAgent.__init__ won't duplicate.
