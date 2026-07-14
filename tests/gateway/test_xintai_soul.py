@@ -27,7 +27,7 @@ def test_sync_xintai_runtime_soul_installs_canonical_content(monkeypatch, tmp_pa
     assert result.backup_path is None
 
 
-def test_sync_xintai_runtime_soul_preserves_existing_custom_file(monkeypatch, tmp_path) -> None:
+def test_sync_xintai_runtime_soul_replaces_old_identity_after_backup(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
 
     from gateway.xintai_soul import sync_xintai_runtime_soul
@@ -35,18 +35,21 @@ def test_sync_xintai_runtime_soul_preserves_existing_custom_file(monkeypatch, tm
     runtime_home = tmp_path / "hermes-home"
     runtime_home.mkdir(parents=True)
     target = runtime_home / "SOUL.md"
-    custom_text = "custom soul line 1\r\ncustom soul line 2\r\n"
-    target.write_bytes(custom_text.encode("utf-8"))
+    old_text = "你是研发助理。\r\n保留旧研发身份。\r\n"
+    target.write_bytes(old_text.encode("utf-8"))
 
     result_first = sync_xintai_runtime_soul()
     result_second = sync_xintai_runtime_soul()
 
-    assert result_first.installed is False
-    assert result_first.reason == "existing_preserved"
+    assert result_first.installed is True
+    assert result_first.reason == "updated_existing"
+    assert result_first.backup_path is not None
+    assert result_first.backup_path.read_bytes() == old_text.encode("utf-8")
     assert result_second.installed is False
-    assert result_second.reason == "existing_preserved"
-    assert target.read_bytes() == custom_text.encode("utf-8")
-    assert not any(runtime_home.glob("SOUL.md.xintai-*.bak"))
+    assert result_second.reason == "already_current"
+    assert "鑫泰铝业智能大脑" in target.read_text(encoding="utf-8")
+    assert "研发助理" not in target.read_text(encoding="utf-8")
+    assert len(list(runtime_home.glob("SOUL.md.xintai-*.bak"))) == 1
 
 
 def test_sync_xintai_runtime_soul_can_be_disabled(monkeypatch, tmp_path) -> None:

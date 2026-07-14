@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import tempfile
@@ -29,21 +30,28 @@ def sync_xintai_runtime_soul() -> XintaiSoulSyncResult:
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if target_path.exists():
+    canonical_text = _canonical_xintai_soul_path().read_text(encoding="utf-8")
+    if target_path.exists() and target_path.read_text(encoding="utf-8") == canonical_text:
         return XintaiSoulSyncResult(
             installed=False,
-            reason="existing_preserved",
+            reason="already_current",
             target_path=target_path,
             backup_path=None,
         )
 
-    canonical_text = _canonical_xintai_soul_path().read_text(encoding="utf-8")
+    backup_path = None
+    reason = "installed_missing"
+    if target_path.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup_path = target_path.with_name(f"{target_path.name}.xintai-{XINTAI_SOUL_VERSION}-{stamp}.bak")
+        backup_path.write_bytes(target_path.read_bytes())
+        reason = "updated_existing"
     _atomic_write_text(target_path, canonical_text)
     return XintaiSoulSyncResult(
         installed=True,
-        reason="installed_missing",
+        reason=reason,
         target_path=target_path,
-        backup_path=None,
+        backup_path=backup_path,
     )
 
 

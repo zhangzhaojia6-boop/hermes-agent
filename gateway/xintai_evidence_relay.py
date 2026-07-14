@@ -4,12 +4,15 @@ import asyncio
 import base64
 from dataclasses import dataclass
 import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import time
 from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from uuid import uuid4
 
 import httpx
 
@@ -22,6 +25,16 @@ _SECRET_ASSIGNMENT_RE = re.compile(
 )
 _SECRET_QUERY_KEYS = {"downloadcode", "download_code", "access_token", "authorization", "signature", "sign", "sig"}
 _INLINE_FILE_BYTES_LIMIT = 10 * 1024 * 1024
+_INLINE_FILE_RAW_KEYS = {
+    "filecontentbase64",
+    "file_content_base64",
+    "filebytesbase64",
+    "file_bytes_base64",
+    "contentbase64",
+    "filebytes",
+    "file_bytes",
+    "downloadedfilebytes",
+}
 _IDENTITY_EXCLUDED_KEYS = {
     "traceid",
     "trace_id",
@@ -40,6 +53,7 @@ class RelayResult:
     trace_id: str
     category: str
     error: str | None = None
+    retry_after_seconds: float | None = None
 
 
 class XintaiEvidenceRelay:
@@ -51,13 +65,13 @@ class XintaiEvidenceRelay:
         inbound_token: str | None = None,
         http_client: httpx.AsyncClient | None = None,
         request_timeout: float = 8.0,
-        max_attempts: int = 3,
-        retry_backoff_seconds: Sequence[float] = (0.25, 0.5, 1.0),
+        max_attempts: int = 7,
+        retry_backoff_seconds: Sequence[float] = (1.0, 5.0, 15.0, 30.0, 60.0, 60.0),
     ) -> None:
         self.enabled = _env_bool("XINTAI_EVIDENCE_RELAY_ENABLED", False) if enabled is None else bool(enabled)
         self.base_url = str(base_url if base_url is not None else os.getenv("XINTAI_DATAHUB_BASE_URL", "")).strip()
         self.inbound_token = str(
-            inbound_token if inbound_token is not None else os.getenv("XINTAI_DINGTALK_INBOUND_TOKEN", "")
+            inbound_token if inbound_token is not None else os.getenv("XINTAI_DINGTALK_STREAM_RELAY_TOKEN", "")
         ).strip()
         self._http_client = http_client
         self.request_timeout = float(request_timeout)
@@ -91,10 +105,10 @@ class XintaiEvidenceRelay:
         trace_id: str,
     ) -> RelayResult:
         url = self.base_url.rstrip("/") + "/api/v1/dingtalk/agent-inbound"
-        headers = {"x-dingtalk-inbound-token": self.inbound_token}
         last_result = RelayResult(accepted=False, trace_id=trace_id, category="relay_not_attempted")
 
         for attempt in range(self.max_attempts):
+            headers = _build_request_auth_headers(self.inbound_token, payload)
             try:
                 response = await client.post(
                     url,
@@ -128,7 +142,7 @@ class XintaiEvidenceRelay:
                 if last_result.accepted:
                     return last_result
 
-            if attempt >= self.max_attempts - 1:
+            if attempt >= self.max_attempts - 1 or not _is_retryable(last_result):
                 break
             LOGGER.warning(
                 "Xintai evidence relay retry trace_id=%s attempt=%d category=%s",
@@ -136,7 +150,10 @@ class XintaiEvidenceRelay:
                 attempt + 1,
                 last_result.category,
             )
-            await asyncio.sleep(self.retry_backoff_seconds[min(attempt, len(self.retry_backoff_seconds) - 1)])
+            delay = last_result.retry_after_seconds
+            if delay is None:
+                delay = self.retry_backoff_seconds[min(attempt, len(self.retry_backoff_seconds) - 1)]
+            await asyncio.sleep(max(0.0, min(float(delay), 120.0)))
 
         LOGGER.warning(
             "Xintai evidence relay failed trace_id=%s category=%s error=%s",
@@ -173,7 +190,55 @@ class XintaiEvidenceRelay:
             trace_id=response_trace_id,
             category=f"http_{int(response.status_code)}",
             error=error_text or None,
+            retry_after_seconds=_retry_after_seconds(response),
         )
+
+
+def _build_request_auth_headers(secret: str, payload: Mapping[str, Any]) -> dict[str, str]:
+    timestamp = str(int(time.time()))
+    nonce = uuid4().hex
+    kind = "dingtalk_stream"
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    signed = (
+        timestamp.encode("ascii")
+        + b"."
+        + nonce.encode("ascii")
+        + b"."
+        + kind.encode("ascii")
+        + b"."
+        + canonical
+    )
+    signature = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
+    return {
+        "x-dingtalk-inbound-timestamp": timestamp,
+        "x-dingtalk-inbound-nonce": nonce,
+        "x-dingtalk-inbound-kind": kind,
+        "x-dingtalk-inbound-signature": f"sha256={signature}",
+    }
+
+
+def _is_retryable(result: RelayResult) -> bool:
+    if result.category in {"timeout", "network_error"}:
+        return True
+    if not result.category.startswith("http_"):
+        return False
+    try:
+        status_code = int(result.category.removeprefix("http_"))
+    except ValueError:
+        return False
+    return status_code in {408, 425, 429} or status_code >= 500
+
+
+def _retry_after_seconds(response: Any) -> float | None:
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    raw_value = headers.get("retry-after") or headers.get("Retry-After")
+    try:
+        value = float(str(raw_value).strip())
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(value, 120.0))
 
 
 def _normalize_payload(payload: Mapping[str, Any], *, trace_id: str) -> dict[str, Any]:
@@ -301,8 +366,15 @@ def _extract_inline_file_content(payload: Mapping[str, Any]) -> dict[str, str] |
         payload.get("contentBase64"),
     )
     if base64_text:
-        digest = _first_text(payload.get("fileHash"), payload.get("file_hash"), payload.get("content_hash"))
-        return {"base64": base64_text, "sha256": digest or _safe_sha256_from_base64(base64_text)}
+        if len(base64_text) > ((_INLINE_FILE_BYTES_LIMIT + 2) // 3) * 4 + 16:
+            return None
+        try:
+            content = base64.b64decode(base64_text, validate=True)
+        except (ValueError, TypeError):
+            return None
+        if len(content) > _INLINE_FILE_BYTES_LIMIT:
+            return None
+        return {"base64": base64_text, "sha256": hashlib.sha256(content).hexdigest()}
 
     raw_bytes = payload.get("fileBytes") or payload.get("file_bytes") or payload.get("downloadedFileBytes")
     if isinstance(raw_bytes, (bytes, bytearray)) and len(raw_bytes) <= _INLINE_FILE_BYTES_LIMIT:
@@ -312,14 +384,6 @@ def _extract_inline_file_content(payload: Mapping[str, Any]) -> dict[str, str] |
             "sha256": hashlib.sha256(binary).hexdigest(),
         }
     return None
-
-
-def _safe_sha256_from_base64(value: str) -> str:
-    try:
-        content = base64.b64decode(value, validate=True)
-    except Exception:  # noqa: BLE001
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()
-    return hashlib.sha256(content).hexdigest()
 
 
 def _extract_message_text(payload: Mapping[str, Any]) -> str:
@@ -429,6 +493,8 @@ def _sanitize_raw_event(value: Any, *, depth: int = 0, excluded_keys: set[str] |
             key_text = str(raw_key)
             lowered = key_text.lower().replace("-", "_")
             if excluded_keys and lowered in excluded_keys:
+                continue
+            if lowered in _INLINE_FILE_RAW_KEYS:
                 continue
             if any(marker in lowered for marker in ("token", "secret", "authorization", "webhook")):
                 continue

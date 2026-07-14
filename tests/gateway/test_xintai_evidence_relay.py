@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 from unittest.mock import AsyncMock
 
@@ -14,10 +17,17 @@ from gateway.xintai_evidence_relay import (
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int, payload: dict | None = None, text: str = ""):
+    def __init__(
+        self,
+        status_code: int,
+        payload: dict | None = None,
+        text: str = "",
+        headers: dict[str, str] | None = None,
+    ):
         self.status_code = status_code
         self._payload = payload or {}
         self.text = text
+        self.headers = headers or {}
 
     def json(self) -> dict:
         return self._payload
@@ -52,9 +62,24 @@ async def test_relay_posts_follow_up_phrase_without_legacy_keyword() -> None:
     assert result == RelayResult(accepted=True, trace_id="trace-follow-up-001", category="accepted", error=None)
     call = client.post.call_args
     assert call.args[0] == "https://datahub.example/api/v1/dingtalk/agent-inbound"
-    assert call.kwargs["headers"] == {"x-dingtalk-inbound-token": "relay-token"}
+    headers = call.kwargs["headers"]
+    assert "x-dingtalk-inbound-token" not in headers
+    canonical = json.dumps(call.kwargs["json"], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    signed = (
+        headers["x-dingtalk-inbound-timestamp"].encode("ascii")
+        + b"."
+        + headers["x-dingtalk-inbound-nonce"].encode("ascii")
+        + b"."
+        + headers["x-dingtalk-inbound-kind"].encode("ascii")
+        + b"."
+        + canonical
+    )
+    expected = hmac.new(b"relay-token", signed, hashlib.sha256).hexdigest()
+    assert headers["x-dingtalk-inbound-signature"] == f"sha256={expected}"
+    assert headers["x-dingtalk-inbound-kind"] == "dingtalk_stream"
     assert call.kwargs["json"]["text"]["content"] == "昨天那个先继续跟一下"
     assert call.kwargs["json"]["traceId"] == "trace-follow-up-001"
+    assert "xintaiSourceTransport" not in call.kwargs["json"]
     assert call.kwargs["timeout"] == 8.0
 
 
@@ -110,6 +135,52 @@ async def test_relay_retries_then_succeeds(monkeypatch) -> None:
     assert result.category == "accepted"
     assert client.post.await_count == 3
     assert sleep_calls == [0.01, 0.02]
+
+
+@pytest.mark.asyncio
+async def test_relay_does_not_retry_permanent_http_rejection(monkeypatch) -> None:
+    client = AsyncMock()
+    client.post = AsyncMock(return_value=_FakeResponse(403, {"detail": "sender_not_allowed"}))
+    sleep = AsyncMock()
+    monkeypatch.setattr("gateway.xintai_evidence_relay.asyncio.sleep", sleep)
+    relay = XintaiEvidenceRelay(
+        enabled=True,
+        base_url="https://datahub.example",
+        inbound_token="relay-token",
+        http_client=client,
+        retry_backoff_seconds=(0, 0, 0),
+    )
+
+    result = await relay.relay({"traceId": "trace-rejected-001", "messageId": "msg-rejected-001"})
+
+    assert result.category == "http_403"
+    assert client.post.await_count == 1
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_relay_retries_rate_limit_and_respects_retry_after(monkeypatch) -> None:
+    client = AsyncMock()
+    client.post = AsyncMock(
+        side_effect=[
+            _FakeResponse(429, {"detail": "rate_limited"}, headers={"Retry-After": "2.5"}),
+            _FakeResponse(200, {"errcode": 0, "trace_id": "trace-rate-limit-001"}),
+        ]
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr("gateway.xintai_evidence_relay.asyncio.sleep", sleep)
+    relay = XintaiEvidenceRelay(
+        enabled=True,
+        base_url="https://datahub.example",
+        inbound_token="relay-token",
+        http_client=client,
+    )
+
+    result = await relay.relay({"traceId": "trace-rate-limit-001", "messageId": "msg-rate-limit-001"})
+
+    assert result.accepted is True
+    assert client.post.await_count == 2
+    sleep.assert_awaited_once_with(2.5)
 
 
 @pytest.mark.asyncio
@@ -192,3 +263,58 @@ def test_build_dingtalk_fallback_identity_ignores_download_secrets() -> None:
     assert "download-secret" not in first
     assert "secret-001" not in first
     assert first.startswith("dingtalk-stream-sha256:")
+
+
+@pytest.mark.asyncio
+async def test_relay_sends_bounded_inline_file_without_copying_binary_into_raw_event() -> None:
+    content = "日报产量 32 吨".encode("utf-8")
+    client = AsyncMock()
+    client.post = AsyncMock(return_value=_FakeResponse(200, {"errcode": 0}))
+    relay = XintaiEvidenceRelay(
+        enabled=True,
+        base_url="https://datahub.example",
+        inbound_token="relay-token",
+        http_client=client,
+    )
+
+    result = await relay.relay(
+        {
+            "messageId": "inline-file-001",
+            "msgtype": "file",
+            "fileName": "日报.txt",
+            "fileBytes": content,
+        }
+    )
+
+    sent = client.post.call_args.kwargs["json"]
+    assert result.accepted is True
+    assert base64.b64decode(sent["fileContentBase64"], validate=True) == content
+    assert sent["fileHash"] == hashlib.sha256(content).hexdigest()
+    assert "fileBytes" not in sent["rawEvent"]
+    assert "fileContentBase64" not in sent["rawEvent"]
+
+
+@pytest.mark.asyncio
+async def test_relay_drops_oversized_inline_file_content_before_http_post() -> None:
+    oversized = base64.b64encode(b"x" * (10 * 1024 * 1024 + 1)).decode("ascii")
+    client = AsyncMock()
+    client.post = AsyncMock(return_value=_FakeResponse(200, {"errcode": 0}))
+    relay = XintaiEvidenceRelay(
+        enabled=True,
+        base_url="https://datahub.example",
+        inbound_token="relay-token",
+        http_client=client,
+    )
+
+    await relay.relay(
+        {
+            "messageId": "oversized-file-001",
+            "msgtype": "file",
+            "fileName": "oversized.bin",
+            "fileContentBase64": oversized,
+        }
+    )
+
+    sent = client.post.call_args.kwargs["json"]
+    assert "fileContentBase64" not in sent
+    assert "fileContentBase64" not in sent["rawEvent"]
