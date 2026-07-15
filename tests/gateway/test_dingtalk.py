@@ -350,6 +350,344 @@ class TestSend:
 
 class TestConnect:
 
+    def test_websocket_connection_explicitly_bypasses_proxy(self, monkeypatch):
+        import plugins.platforms.dingtalk.adapter as dt
+
+        sentinel = object()
+        connect = MagicMock(return_value=sentinel)
+        monkeypatch.setattr(dt.websockets, "connect", connect)
+
+        result = dt._open_dingtalk_websocket("wss://stream.example/connect")
+
+        assert result is sentinel
+        connect.assert_called_once_with(
+            "wss://stream.example/connect",
+            proxy=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_connection_tracks_real_websocket_lifecycle(self, monkeypatch):
+        import plugins.platforms.dingtalk.adapter as dt
+
+        adapter = dt.DingTalkAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"client_id": "test-id", "client_secret": "test-secret"},
+            )
+        )
+        received_messages = []
+        keepalive_started = asyncio.Event()
+        keepalive_cancelled = asyncio.Event()
+
+        class FakeWebSocket:
+            def __init__(self):
+                self._sent = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._sent:
+                    raise StopAsyncIteration
+                self._sent = True
+                assert adapter._running is True
+                assert adapter.get_xintai_stream_health()["connected"] is True
+                await keepalive_started.wait()
+                return '{"event":"hello"}'
+
+        websocket = FakeWebSocket()
+
+        class FakeWebSocketContext:
+            async def __aenter__(self):
+                return websocket
+
+            async def __aexit__(self, _exc_type, _exc, _tb):
+                return False
+
+        async def keepalive(_websocket):
+            keepalive_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                keepalive_cancelled.set()
+
+        async def background_task(message):
+            received_messages.append(message)
+
+        stream_client = SimpleNamespace(
+            websocket=None,
+            pre_start=MagicMock(),
+            open_connection=MagicMock(
+                return_value={
+                    "endpoint": "wss://stream.example/connect",
+                    "ticket": "ticket value",
+                }
+            ),
+            keepalive=keepalive,
+            background_task=background_task,
+        )
+        adapter._stream_client = stream_client
+        open_websocket = MagicMock(return_value=FakeWebSocketContext())
+        monkeypatch.setattr(dt, "_open_dingtalk_websocket", open_websocket)
+
+        await adapter._run_stream_connection()
+        await asyncio.sleep(0)
+
+        stream_client.pre_start.assert_called_once_with()
+        open_websocket.assert_called_once_with(
+            "wss://stream.example/connect?ticket=ticket+value"
+        )
+        assert adapter._stream_ready_event.is_set() is True
+        assert keepalive_cancelled.is_set() is True
+        assert received_messages == [{"event": "hello"}]
+        assert stream_client.websocket is None
+        assert adapter._running is False
+        assert adapter.get_xintai_stream_health()["connected"] is False
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_stream_callback_tasks(self, monkeypatch):
+        import plugins.platforms.dingtalk.adapter as dt
+
+        adapter = dt.DingTalkAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"client_id": "test-id", "client_secret": "test-secret"},
+            )
+        )
+        callback_started = asyncio.Event()
+        callback_release = asyncio.Event()
+        callback_cancelled = asyncio.Event()
+
+        class FakeWebSocket:
+            def __init__(self):
+                self._sent = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._sent:
+                    raise StopAsyncIteration
+                self._sent = True
+                return '{"event":"slow"}'
+
+        class FakeWebSocketContext:
+            async def __aenter__(self):
+                return FakeWebSocket()
+
+            async def __aexit__(self, _exc_type, _exc, _tb):
+                return False
+
+        async def keepalive(_websocket):
+            await asyncio.Event().wait()
+
+        async def background_task(_message):
+            callback_started.set()
+            try:
+                await callback_release.wait()
+            finally:
+                callback_cancelled.set()
+
+        adapter._stream_client = SimpleNamespace(
+            websocket=None,
+            pre_start=MagicMock(),
+            open_connection=MagicMock(
+                return_value={
+                    "endpoint": "wss://stream.example/connect",
+                    "ticket": "ticket",
+                }
+            ),
+            keepalive=keepalive,
+            background_task=background_task,
+        )
+        monkeypatch.setattr(
+            dt,
+            "_open_dingtalk_websocket",
+            MagicMock(return_value=FakeWebSocketContext()),
+        )
+
+        await adapter._run_stream_connection()
+        await callback_started.wait()
+
+        try:
+            assert len(adapter._bg_tasks) == 1
+            await adapter.disconnect()
+            assert callback_cancelled.is_set() is True
+            assert adapter._bg_tasks == set()
+        finally:
+            callback_release.set()
+            await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_connect_reports_ready_only_after_websocket_handshake(self, monkeypatch):
+        import plugins.platforms.dingtalk.adapter as dt
+
+        stream_started = asyncio.Event()
+        release_handshake = asyncio.Event()
+        keep_running = asyncio.Event()
+        websocket = SimpleNamespace(
+            state=SimpleNamespace(name="OPEN"),
+            close=AsyncMock(),
+        )
+
+        class FakeStreamClient:
+            websocket = None
+
+            def register_callback_handler(self, _topic, _handler):
+                return None
+
+        stream_client = FakeStreamClient()
+        http_client = AsyncMock()
+        fake_sdk = SimpleNamespace(
+            Credential=lambda *_args: object(),
+            DingTalkStreamClient=lambda _credential: stream_client,
+            ChatbotMessage=SimpleNamespace(TOPIC="chatbot"),
+        )
+        monkeypatch.setattr(dt, "dingtalk_stream", fake_sdk)
+        monkeypatch.setattr(dt, "DINGTALK_STREAM_AVAILABLE", True)
+        monkeypatch.setattr(dt, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(dt, "CARD_SDK_AVAILABLE", False)
+        monkeypatch.setattr(dt.httpx, "AsyncClient", lambda **_kwargs: http_client)
+
+        adapter = dt.DingTalkAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"client_id": "test-id", "client_secret": "test-secret"},
+            )
+        )
+
+        async def fake_run_stream():
+            stream_started.set()
+            await release_handshake.wait()
+            stream_client.websocket = websocket
+            adapter._mark_connected()
+            adapter._xintai_stream_health.set_stream_running(True)
+            adapter._stream_ready_event.set()
+            await keep_running.wait()
+
+        monkeypatch.setattr(adapter, "_run_stream", fake_run_stream)
+        connect_task = asyncio.create_task(adapter.connect())
+        await stream_started.wait()
+
+        assert adapter._running is False
+        assert adapter.get_xintai_stream_health()["connected"] is False
+
+        release_handshake.set()
+        assert await asyncio.wait_for(connect_task, timeout=1.0) is True
+        assert adapter._running is True
+        assert adapter.get_xintai_stream_health()["connected"] is True
+
+        await adapter.disconnect()
+        websocket.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_connect_timeout_cancels_stream_and_cleans_resources(self, monkeypatch):
+        import plugins.platforms.dingtalk.adapter as dt
+
+        stream_started = asyncio.Event()
+        stream_cancelled = asyncio.Event()
+
+        class FakeStreamClient:
+            websocket = None
+
+            def register_callback_handler(self, _topic, _handler):
+                return None
+
+        stream_client = FakeStreamClient()
+        http_client = AsyncMock()
+        fake_sdk = SimpleNamespace(
+            Credential=lambda *_args: object(),
+            DingTalkStreamClient=lambda _credential: stream_client,
+            ChatbotMessage=SimpleNamespace(TOPIC="chatbot"),
+        )
+        monkeypatch.setattr(dt, "dingtalk_stream", fake_sdk)
+        monkeypatch.setattr(dt, "DINGTALK_STREAM_AVAILABLE", True)
+        monkeypatch.setattr(dt, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(dt, "CARD_SDK_AVAILABLE", False)
+        monkeypatch.setattr(dt, "STREAM_CONNECT_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr(dt.httpx, "AsyncClient", lambda **_kwargs: http_client)
+
+        adapter = dt.DingTalkAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"client_id": "test-id", "client_secret": "test-secret"},
+            )
+        )
+
+        async def fake_run_stream():
+            stream_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stream_cancelled.set()
+
+        monkeypatch.setattr(adapter, "_run_stream", fake_run_stream)
+
+        assert await adapter.connect() is False
+        assert stream_started.is_set() is True
+        assert stream_cancelled.is_set() is True
+        assert adapter._stream_task is None
+        assert adapter._stream_client is None
+        assert adapter._running is False
+        assert adapter.get_xintai_stream_health()["connected"] is False
+        http_client.aclose.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_connect_cancellation_cleans_resources_and_propagates(self, monkeypatch):
+        import plugins.platforms.dingtalk.adapter as dt
+
+        stream_started = asyncio.Event()
+        stream_cancelled = asyncio.Event()
+
+        class FakeStreamClient:
+            websocket = None
+
+            def register_callback_handler(self, _topic, _handler):
+                return None
+
+        stream_client = FakeStreamClient()
+        http_client = AsyncMock()
+        fake_sdk = SimpleNamespace(
+            Credential=lambda *_args: object(),
+            DingTalkStreamClient=lambda _credential: stream_client,
+            ChatbotMessage=SimpleNamespace(TOPIC="chatbot"),
+        )
+        monkeypatch.setattr(dt, "dingtalk_stream", fake_sdk)
+        monkeypatch.setattr(dt, "DINGTALK_STREAM_AVAILABLE", True)
+        monkeypatch.setattr(dt, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(dt, "CARD_SDK_AVAILABLE", False)
+        monkeypatch.setattr(dt.httpx, "AsyncClient", lambda **_kwargs: http_client)
+
+        adapter = dt.DingTalkAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"client_id": "test-id", "client_secret": "test-secret"},
+            )
+        )
+
+        async def fake_run_stream():
+            stream_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stream_cancelled.set()
+
+        monkeypatch.setattr(adapter, "_run_stream", fake_run_stream)
+        connect_task = asyncio.create_task(adapter.connect())
+        await stream_started.wait()
+
+        connect_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await connect_task
+
+        assert stream_cancelled.is_set() is True
+        assert adapter._stream_task is None
+        assert adapter._stream_client is None
+        assert adapter._http_client is None
+        assert adapter._running is False
+        assert adapter.get_xintai_stream_health()["connected"] is False
+        http_client.aclose.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_disconnect_closes_session_websocket(self):
         from plugins.platforms.dingtalk.adapter import DingTalkAdapter
