@@ -35,6 +35,9 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
+from urllib.parse import quote_plus
+
+import websockets
 
 try:
     import dingtalk_stream
@@ -113,6 +116,7 @@ logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 20000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
+STREAM_CONNECT_TIMEOUT_SECONDS = 20.0
 _SESSION_WEBHOOKS_MAX = 500
 _DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:api|oapi)\.dingtalk\.com/')
 
@@ -121,6 +125,11 @@ DINGTALK_TYPE_MAPPING = {
     "picture": "image",
     "voice": "audio",
 }
+
+
+def _open_dingtalk_websocket(uri: str):
+    """Open DingTalk directly; service-level HTTP proxies cannot relay its WSS."""
+    return websockets.connect(uri, proxy=None)
 
 
 def check_dingtalk_requirements() -> bool:
@@ -211,6 +220,7 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         self._stream_client: Any = None
         self._stream_task: Optional[asyncio.Task] = None
+        self._stream_ready_event = asyncio.Event()
         self._http_client: Optional["httpx.AsyncClient"] = None
         self._card_sdk: Optional[Any] = None
         self._robot_sdk: Optional[Any] = None
@@ -313,43 +323,108 @@ class DingTalkAdapter(BasePlatformAdapter):
             self._xintai_evidence_relay.bind_http_client(local_http_client)
             self._accepting_events = True
             self._shutting_down = False
+            self._stream_ready_event.clear()
             self._stream_task = asyncio.create_task(self._run_stream())
-            self._mark_connected()
-            self._xintai_stream_health.set_stream_running(True)
+            if not await self._wait_for_stream_ready():
+                raise TimeoutError(
+                    f"Stream WebSocket handshake did not complete within "
+                    f"{STREAM_CONNECT_TIMEOUT_SECONDS:g}s"
+                )
             logger.info("[%s] Connected via Stream Mode", self.name)
             return True
+        except asyncio.CancelledError:
+            await self._cleanup_failed_connect(local_http_client)
+            raise
         except Exception as e:
-            self._accepting_events = False
-            self._stream_task = None
-            self._stream_client = None
-            self._http_client = None
-            self._xintai_evidence_relay.bind_http_client(None)
-            self._xintai_stream_health.set_stream_running(False)
-            if local_http_client is not None:
-                await local_http_client.aclose()
+            await self._cleanup_failed_connect(local_http_client)
             logger.error("[%s] Failed to connect: %s", self.name, e)
             return False
+
+    async def _cleanup_failed_connect(
+        self,
+        local_http_client: Optional["httpx.AsyncClient"],
+    ) -> None:
+        self._accepting_events = False
+        self._shutting_down = True
+        if self._stream_task is not None:
+            self._stream_task.cancel()
+            await asyncio.gather(self._stream_task, return_exceptions=True)
+        self._stream_task = None
+        self._stream_client = None
+        self._http_client = None
+        self._stream_ready_event.clear()
+        self._xintai_evidence_relay.bind_http_client(None)
+        self._xintai_stream_health.set_stream_running(False)
+        self._mark_disconnected()
+        if local_http_client is not None:
+            await local_http_client.aclose()
+
+    async def _wait_for_stream_ready(self) -> bool:
+        try:
+            await asyncio.wait_for(
+                self._stream_ready_event.wait(),
+                timeout=STREAM_CONNECT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            return False
+        return bool(
+            self._stream_task is not None
+            and not self._stream_task.done()
+            and self._running
+            and self._xintai_stream_health.connected
+        )
+
+    async def _run_stream_connection(self) -> None:
+        self._stream_client.pre_start()
+        connection = await asyncio.to_thread(self._stream_client.open_connection)
+        if not connection:
+            raise ConnectionError("DingTalk open-connection request failed")
+
+        uri = (
+            f'{connection["endpoint"]}?ticket='
+            f'{quote_plus(connection["ticket"])}'
+        )
+        async with _open_dingtalk_websocket(uri) as websocket:
+            self._stream_client.websocket = websocket
+            self._mark_connected()
+            self._xintai_stream_health.set_stream_running(True)
+            self._stream_ready_event.set()
+            keepalive_task = asyncio.create_task(
+                self._stream_client.keepalive(websocket)
+            )
+            try:
+                async for raw_message in websocket:
+                    message = json.loads(raw_message)
+                    self._spawn_bg(self._stream_client.background_task(message))
+            finally:
+                keepalive_task.cancel()
+                await asyncio.gather(keepalive_task, return_exceptions=True)
+                if self._stream_client.websocket is websocket:
+                    self._stream_client.websocket = None
+                self._xintai_stream_health.set_stream_running(False)
+                if not self._shutting_down:
+                    self._mark_disconnected()
 
     async def _run_stream(self) -> None:
         """Run the async stream client with auto-reconnection."""
         backoff_idx = 0
-        while self._running:
+        while not self._shutting_down:
             try:
-                self._xintai_stream_health.set_stream_running(True)
                 logger.debug("[%s] Starting stream client...", self.name)
-                await self._stream_client.start()
+                await self._run_stream_connection()
             except asyncio.CancelledError:
                 self._xintai_stream_health.set_stream_running(False)
                 return
             except Exception as e:
                 self._xintai_stream_health.set_stream_running(False)
-                if not self._running:
+                if self._shutting_down:
                     return
                 logger.warning("[%s] Stream client error: %s", self.name, e)
             else:
                 self._xintai_stream_health.set_stream_running(False)
+                backoff_idx = 0
 
-            if not self._running:
+            if self._shutting_down:
                 return
 
             delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
