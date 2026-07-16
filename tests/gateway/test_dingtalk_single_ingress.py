@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -13,7 +14,9 @@ from gateway.platforms.base import MessageEvent
 from plugins.platforms.dingtalk.adapter import DingTalkAdapter
 from plugins.platforms.dingtalk import adapter as dingtalk_module
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.xintai_callback_proof_ledger import get_proof_ledger_path
 from gateway.xintai_evidence_relay import RelayResult
+from gateway.xintai_soul import sync_xintai_runtime_soul
 
 
 def _make_dingtalk_message(*, text: str = "", payload: dict | None = None, **overrides):
@@ -55,6 +58,11 @@ def _make_connected_adapter() -> DingTalkAdapter:
     adapter._shutting_down = False
     adapter._mark_connected()
     return adapter
+
+
+def _read_callback_proof_entries() -> list[dict[str, str]]:
+    payload = json.loads(get_proof_ledger_path().read_text(encoding="utf-8"))
+    return payload["entries"]
 
 
 @pytest.mark.asyncio
@@ -422,6 +430,364 @@ async def test_direct_late_on_message_is_dropped_once_disconnect_begins() -> Non
     assert len(adapter._xintai_relay_tasks) == 0
 
 
+@pytest.mark.asyncio
+async def test_stream_process_records_callback_proof_before_background_dispatch(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_connected_adapter()
+    adapter._on_message = AsyncMock()
+    callback_message = _make_dingtalk_message(
+        text="敏感原文不要进账本",
+        payload={
+            "msgtype": "file",
+            "fileName": "日报.xlsx",
+            "downloadCode": "download-secret-001",
+            "sessionWebhook": "https://callback.example/webhook",
+        },
+        message_id="msg-sensitive-001",
+        sender_id="sender-sensitive-001",
+        conversation_id="conversation-sensitive-001",
+        conversation_type="2",
+    )
+    create_task_seen: list[str] = []
+    proof_written_before_first_create_task = False
+
+    def _fake_create_task(coro):
+        nonlocal proof_written_before_first_create_task
+        create_task_seen.append("create_task")
+        if len(create_task_seen) == 1:
+            assert get_proof_ledger_path().exists() is True
+            entries = _read_callback_proof_entries()
+            assert len(entries) == 1
+            assert entries[0]["message_type"] == "file"
+            assert entries[0]["channel_type"] == "group"
+            proof_written_before_first_create_task = True
+        coro.close()
+        task = asyncio.get_running_loop().create_future()
+        task.set_result(None)
+        return task
+
+    monkeypatch.setattr(
+        dingtalk_module,
+        "AckMessage",
+        SimpleNamespace(STATUS_OK="ACK_OK", STATUS_SYSTEM_EXCEPTION="ACK_ERROR"),
+    )
+    monkeypatch.setattr(
+        dingtalk_module,
+        "ChatbotMessage",
+        SimpleNamespace(from_dict=lambda _payload: callback_message),
+        raising=False,
+    )
+    monkeypatch.setattr(dingtalk_module.asyncio, "create_task", _fake_create_task)
+
+    result = await dingtalk_module._IncomingHandler(
+        adapter,
+        asyncio.get_running_loop(),
+    ).process(SimpleNamespace(data=callback_message.data))
+
+    assert result == ("ACK_OK", "OK")
+    assert create_task_seen
+    assert proof_written_before_first_create_task is True
+    serialized = get_proof_ledger_path().read_text(encoding="utf-8")
+    assert "敏感原文不要进账本" not in serialized
+    assert "日报.xlsx" not in serialized
+    assert "sender-sensitive-001" not in serialized
+    assert "conversation-sensitive-001" not in serialized
+    assert "msg-sensitive-001" not in serialized
+    assert "download-secret-001" not in serialized
+    assert "callback.example/webhook" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_stream_process_empty_trace_skips_callback_proof_ledger(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_connected_adapter()
+    adapter._on_message = AsyncMock()
+    adapter._resolve_message_id = MagicMock(return_value="  ")
+    callback_message = _make_dingtalk_message(
+        text="没有 trace 也要继续处理",
+        payload={"msgtype": "text", "messageId": None},
+        message_id=None,
+    )
+    recorded_calls = []
+
+    def _fake_create_task(coro):
+        coro.close()
+        task = asyncio.get_running_loop().create_future()
+        task.set_result(None)
+        return task
+
+    monkeypatch.setattr(
+        dingtalk_module,
+        "AckMessage",
+        SimpleNamespace(STATUS_OK="ACK_OK", STATUS_SYSTEM_EXCEPTION="ACK_ERROR"),
+    )
+    monkeypatch.setattr(
+        dingtalk_module,
+        "ChatbotMessage",
+        SimpleNamespace(from_dict=lambda _payload: callback_message),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        dingtalk_module,
+        "record_stream_callback_proof",
+        lambda **kwargs: recorded_calls.append(kwargs),
+    )
+    monkeypatch.setattr(dingtalk_module.asyncio, "create_task", _fake_create_task)
+
+    result = await dingtalk_module._IncomingHandler(
+        adapter,
+        asyncio.get_running_loop(),
+    ).process(SimpleNamespace(data=callback_message.data))
+
+    assert result == ("ACK_OK", "OK")
+    assert recorded_calls == []
+    assert get_proof_ledger_path().exists() is False
+
+
+@pytest.mark.asyncio
+async def test_stream_process_passes_injected_utc_callback_receive_time(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_connected_adapter()
+    adapter._on_message = AsyncMock()
+    callback_message = _make_dingtalk_message(
+        text="固定回调时间",
+        payload={"msgtype": "text"},
+        message_id="msg-fixed-clock-001",
+    )
+    captured = {}
+
+    def _fake_create_task(coro):
+        coro.close()
+        task = asyncio.get_running_loop().create_future()
+        task.set_result(None)
+        return task
+
+    monkeypatch.setattr(
+        dingtalk_module,
+        "AckMessage",
+        SimpleNamespace(STATUS_OK="ACK_OK", STATUS_SYSTEM_EXCEPTION="ACK_ERROR"),
+    )
+    monkeypatch.setattr(
+        dingtalk_module,
+        "ChatbotMessage",
+        SimpleNamespace(from_dict=lambda _payload: callback_message),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        dingtalk_module,
+        "record_stream_callback_proof",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    monkeypatch.setattr(dingtalk_module.asyncio, "create_task", _fake_create_task)
+
+    fixed_clock = lambda: datetime(2026, 7, 16, 8, 9, 10, tzinfo=timezone.utc)
+    result = await dingtalk_module._IncomingHandler(
+        adapter,
+        asyncio.get_running_loop(),
+        clock=fixed_clock,
+    ).process(SimpleNamespace(data=callback_message.data))
+
+    assert result == ("ACK_OK", "OK")
+    assert captured["callback_receive_time"] == "2026-07-16T08:09:10+00:00"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("accepting_events", "shutting_down"),
+    [
+        (False, False),
+        (True, True),
+    ],
+    ids=["inactive", "shutdown"],
+)
+async def test_stream_process_inactive_callback_still_records_ledger_without_dispatch(
+    monkeypatch,
+    tmp_path,
+    accepting_events,
+    shutting_down,
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_connected_adapter()
+    adapter._accepting_events = accepting_events
+    adapter._shutting_down = shutting_down
+    adapter._on_message = AsyncMock()
+    adapter._spawn_bg = MagicMock()
+    callback_message = _make_dingtalk_message(
+        text="停机窗口也要留证明",
+        payload={"msgtype": "text"},
+        message_id="msg-inactive-proof-001",
+        conversation_type="2",
+    )
+    create_task_seen: list[str] = []
+
+    def _fake_create_task(coro):
+        create_task_seen.append("create_task")
+        coro.close()
+        task = asyncio.get_running_loop().create_future()
+        task.set_result(None)
+        return task
+
+    monkeypatch.setattr(
+        dingtalk_module,
+        "AckMessage",
+        SimpleNamespace(STATUS_OK="ACK_OK", STATUS_SYSTEM_EXCEPTION="ACK_ERROR"),
+    )
+    monkeypatch.setattr(
+        dingtalk_module,
+        "ChatbotMessage",
+        SimpleNamespace(from_dict=lambda _payload: callback_message),
+        raising=False,
+    )
+    monkeypatch.setattr(dingtalk_module.asyncio, "create_task", _fake_create_task)
+
+    result = await dingtalk_module._IncomingHandler(
+        adapter,
+        asyncio.get_running_loop(),
+    ).process(SimpleNamespace(data=callback_message.data))
+
+    assert result == ("ACK_OK", "OK")
+    assert create_task_seen == []
+    adapter._spawn_bg.assert_not_called()
+    adapter._on_message.assert_not_called()
+    entries = _read_callback_proof_entries()
+    assert len(entries) == 1
+    assert entries[0]["message_type"] == "text"
+    assert entries[0]["channel_type"] == "group"
+
+
+@pytest.mark.asyncio
+async def test_stream_process_duplicate_callback_keeps_single_proof_entry(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_connected_adapter()
+    adapter._on_message = AsyncMock()
+    callback_message = _make_dingtalk_message(
+        text="重复消息",
+        payload={"msgtype": "text"},
+        message_id="msg-duplicate-proof-001",
+        conversation_type="1",
+    )
+
+    def _fake_create_task(coro):
+        coro.close()
+        task = asyncio.get_running_loop().create_future()
+        task.set_result(None)
+        return task
+
+    monkeypatch.setattr(
+        dingtalk_module,
+        "AckMessage",
+        SimpleNamespace(STATUS_OK="ACK_OK", STATUS_SYSTEM_EXCEPTION="ACK_ERROR"),
+    )
+    monkeypatch.setattr(
+        dingtalk_module,
+        "ChatbotMessage",
+        SimpleNamespace(from_dict=lambda _payload: callback_message),
+        raising=False,
+    )
+    monkeypatch.setattr(dingtalk_module.asyncio, "create_task", _fake_create_task)
+    handler = dingtalk_module._IncomingHandler(adapter, asyncio.get_running_loop())
+    callback = SimpleNamespace(data=callback_message.data)
+
+    first = await handler.process(callback)
+    second = await handler.process(callback)
+
+    assert first == ("ACK_OK", "OK")
+    assert second == ("ACK_OK", "OK")
+    entries = _read_callback_proof_entries()
+    assert len(entries) == 1
+    assert entries[0]["message_type"] == "text"
+    assert entries[0]["channel_type"] == "private"
+
+
+@pytest.mark.asyncio
+async def test_stream_process_ledger_failure_still_acks_and_schedules_background_work(
+    monkeypatch,
+    caplog,
+) -> None:
+    adapter = _make_connected_adapter()
+    adapter._on_message = AsyncMock()
+    callback_message = _make_dingtalk_message(
+        text="账本失败也别挡住处理",
+        payload={"msgtype": "text"},
+        message_id="msg-ledger-error-001",
+    )
+    created_tasks = []
+
+    def _boom(**_kwargs):
+        raise RuntimeError("ledger exploded")
+
+    monkeypatch.setattr(
+        dingtalk_module,
+        "AckMessage",
+        SimpleNamespace(STATUS_OK="ACK_OK", STATUS_SYSTEM_EXCEPTION="ACK_ERROR"),
+    )
+    monkeypatch.setattr(
+        dingtalk_module,
+        "ChatbotMessage",
+        SimpleNamespace(from_dict=lambda _payload: callback_message),
+        raising=False,
+    )
+    monkeypatch.setattr(dingtalk_module, "record_stream_callback_proof", _boom)
+    original_create_task = asyncio.create_task
+
+    def _tracking_create_task(coro):
+        task = original_create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(dingtalk_module.asyncio, "create_task", _tracking_create_task)
+    handler = dingtalk_module._IncomingHandler(adapter, asyncio.get_running_loop())
+
+    with caplog.at_level("ERROR"):
+        ack = await handler.process(SimpleNamespace(data=callback_message.data))
+        await asyncio.sleep(0)
+        if created_tasks:
+            await asyncio.gather(*created_tasks)
+
+    assert ack == ("ACK_OK", "OK")
+    adapter._on_message.assert_awaited_once()
+    assert "proof ledger" in caplog.text.lower()
+    assert "ledger exploded" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_direct_on_message_does_not_write_callback_proof_ledger(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _make_connected_adapter()
+    adapter._xintai_evidence_relay = SimpleNamespace(
+        relay=AsyncMock(return_value=RelayResult(True, "msg-direct-only-001", "accepted"))
+    )
+    adapter.handle_message = AsyncMock()
+    direct_message = _make_dingtalk_message(
+        text="直接调用 _on_message 不记账",
+        payload={"msgtype": "text"},
+        message_id="msg-direct-only-001",
+    )
+
+    await adapter._on_message(direct_message)
+    tasks = list(adapter._xintai_relay_tasks)
+    if tasks:
+        await asyncio.gather(*tasks)
+        await asyncio.sleep(0)
+
+    assert get_proof_ledger_path().exists() is False
+
+
 def test_build_xintai_payload_uses_event_timestamp_metadata() -> None:
     adapter = DingTalkAdapter(PlatformConfig(enabled=True))
     message = _make_dingtalk_message(
@@ -521,6 +887,13 @@ async def test_keyword_bridge_no_longer_intercepts_dingtalk_messages() -> None:
 @pytest.mark.asyncio
 async def test_runtime_help_and_status_use_xintai_identity(monkeypatch) -> None:
     monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+    monkeypatch.setattr(
+        "gateway.slash_commands.t",
+        lambda key, **kwargs: {
+            "gateway.help.header": "📖 **鑫泰铝业智能大脑 可用指令**",
+            "gateway.status.header": "📊 **鑫泰铝业智能大脑 运行状态**",
+        }.get(key, key),
+    )
     runner, source = _make_runner()
 
     help_result = await runner._handle_message(
@@ -544,6 +917,12 @@ async def test_runtime_help_and_status_use_xintai_identity(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_status_exposes_dingtalk_stream_health_snapshot(monkeypatch) -> None:
     monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+    monkeypatch.setattr(
+        "gateway.slash_commands.t",
+        lambda key, **kwargs: {
+            "gateway.status.header": "📊 **鑫泰铝业智能大脑 运行状态**",
+        }.get(key, key),
+    )
     runner, source = _make_runner()
     runner.adapters[Platform.DINGTALK].get_xintai_stream_health.return_value = {
         "connected": True,
@@ -682,9 +1061,13 @@ async def test_missing_message_id_file_events_use_stable_idempotent_identity() -
     assert "download-secret-002" not in first_payload["messageId"]
 
 
-def test_docker_soul_declares_xintai_identity_in_chinese() -> None:
-    soul = (Path(__file__).resolve().parents[2] / "docker" / "SOUL.md").read_text(encoding="utf-8")
+def test_runtime_soul_sync_keeps_xintai_identity_in_chinese(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
+    result = sync_xintai_runtime_soul()
+    soul = (tmp_path / "SOUL.md").read_text(encoding="utf-8")
+
+    assert result.installed is True
     assert "鑫泰铝业智能大脑" in soul
     assert "只用中文" in soul
     assert "钉钉证据" in soul

@@ -34,7 +34,7 @@ import re
 import traceback
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import quote_plus
 
 import websockets
@@ -105,6 +105,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.xintai_callback_proof_ledger import record_stream_callback_proof
 from gateway.xintai_evidence_relay import (
     XintaiEvidenceRelay,
     build_dingtalk_fallback_identity,
@@ -118,6 +119,50 @@ MAX_MESSAGE_LENGTH = 20000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 STREAM_CONNECT_TIMEOUT_SECONDS = 20.0
 _SESSION_WEBHOOKS_MAX = 500
+
+
+def _callback_receive_time_utc_iso(
+    clock: Callable[[], datetime] | None = None,
+) -> str:
+    current = clock() if clock is not None else datetime.now(tz=timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    else:
+        current = current.astimezone(timezone.utc)
+    return current.isoformat()
+
+
+def _callback_message_type(
+    chatbot_msg: "ChatbotMessage",
+    raw_data: dict[str, Any] | None,
+) -> str:
+    payload = dict(getattr(chatbot_msg, "data", {}) or {})
+    if raw_data:
+        payload.update(raw_data)
+    for candidate in (
+        getattr(chatbot_msg, "msgtype", None),
+        getattr(chatbot_msg, "message_type", None),
+        payload.get("msgtype"),
+        payload.get("messageType"),
+        payload.get("message_type"),
+    ):
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return "unknown"
+
+
+def _callback_channel_type(
+    chatbot_msg: "ChatbotMessage",
+    raw_data: dict[str, Any] | None,
+) -> str:
+    raw_value = (
+        getattr(chatbot_msg, "conversation_type", None)
+        or (raw_data or {}).get("conversationType")
+        or (raw_data or {}).get("conversation_type")
+    )
+    normalized = str(raw_value or "").strip().lower()
+    return "group" if normalized in {"2", "group"} else "private"
 _DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:api|oapi)\.dingtalk\.com/')
 
 # DingTalk message type → runtime content type
@@ -1664,11 +1709,18 @@ class _IncomingHandler(
     CallbackMessage.data dict into a ChatbotMessage before forwarding.
     """
 
-    def __init__(self, adapter: DingTalkAdapter, loop: Optional[asyncio.AbstractEventLoop] = None):
+    def __init__(
+        self,
+        adapter: DingTalkAdapter,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ):
         if DINGTALK_STREAM_AVAILABLE:
             super().__init__()
         self._adapter = adapter
         self._loop = loop
+        self._clock = clock
 
     def pre_start(self) -> None:
         """No-op pre-start hook required by dingtalk-stream SDK.
@@ -1691,19 +1743,20 @@ class _IncomingHandler(
         method returns the ACK immediately — blocking here would prevent the
         SDK from sending heartbeats, eventually causing a disconnect.
         """
-        if not self._adapter._can_accept_events():
-            return AckMessage.STATUS_OK, "OK"
+        callback_receive_time = _callback_receive_time_utc_iso(self._clock)
+        accepting_snapshot = self._adapter._can_accept_events()
 
         try:
             # CallbackMessage.data is a dict containing the raw DingTalk payload
             data = message.data
             if isinstance(data, str):
                 data = json.loads(data)
+            raw_data = dict(data) if isinstance(data, dict) else None
 
             # Parse dict into ChatbotMessage using SDK's from_dict
             chatbot_msg = ChatbotMessage.from_dict(data)
-            if isinstance(data, dict):
-                chatbot_msg.data = dict(data)
+            if raw_data is not None:
+                chatbot_msg.data = dict(raw_data)
 
             # Ensure session_webhook is populated even if the SDK's
             # from_dict() did not map it (field name mismatch across
@@ -1728,6 +1781,28 @@ class _IncomingHandler(
                 if raw_flag:
                     chatbot_msg.is_in_at_list = True
 
+            trace_id = (
+                str(getattr(chatbot_msg, "message_id", "") or "").strip()
+                or self._adapter._resolve_message_id(chatbot_msg)
+            )
+            trace_id = str(trace_id or "").strip()
+            if trace_id:
+                try:
+                    record_stream_callback_proof(
+                        trace_id=trace_id,
+                        message_type=_callback_message_type(chatbot_msg, raw_data),
+                        channel_type=_callback_channel_type(chatbot_msg, raw_data),
+                        callback_receive_time=callback_receive_time,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[%s] Error recording callback proof ledger",
+                        self._adapter.name,
+                    )
+
+            if not accepting_snapshot or not self._adapter._can_accept_events():
+                return AckMessage.STATUS_OK, "OK"
+
             msg_id = getattr(chatbot_msg, "message_id", None) or ""
             conversation_id = getattr(chatbot_msg, "conversation_id", None) or ""
 
@@ -1749,6 +1824,8 @@ class _IncomingHandler(
             logger.exception(
                 "[%s] Error preparing incoming message", self._adapter.name
             )
+            if not accepting_snapshot:
+                return AckMessage.STATUS_OK, "OK"
             return AckMessage.STATUS_SYSTEM_EXCEPTION, "error"
 
         return AckMessage.STATUS_OK, "OK"
