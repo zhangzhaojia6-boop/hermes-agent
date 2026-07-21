@@ -164,6 +164,10 @@ def _callback_channel_type(
     normalized = str(raw_value or "").strip().lower()
     return "group" if normalized in {"2", "group"} else "private"
 _DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:api|oapi)\.dingtalk\.com/')
+_MENTIONED_SLASH_COMMAND_RE = re.compile(
+    r"^\s*@[^\s]+\s+(?P<command>/[A-Za-z][\w-]*(?:\s+.*)?)\s*$",
+    re.DOTALL,
+)
 
 # DingTalk message type → runtime content type
 DINGTALK_TYPE_MAPPING = {
@@ -913,6 +917,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         conversation_id = getattr(message, "conversation_id", "") or ""
         conversation_type = getattr(message, "conversation_type", "1")
         is_group = str(conversation_type) == "2"
+        gateway_text = self._gateway_text(text, message=message, is_group=is_group)
         sender_id = getattr(message, "sender_id", "") or ""
         sender_nick = getattr(message, "sender_nick", "") or sender_id
         sender_staff_id = getattr(message, "sender_staff_id", "") or ""
@@ -969,7 +974,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         # Determine message type and build media list
         msg_type, media_urls, media_types = self._extract_media(message)
 
-        if not text and not media_urls:
+        if not gateway_text and not media_urls:
             logger.debug("[%s] Empty message, skipping", self.name)
             return
 
@@ -983,7 +988,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         )
 
         event = MessageEvent(
-            text=text,
+            text=gateway_text,
             message_type=msg_type,
             source=source,
             message_id=msg_id,
@@ -998,9 +1003,22 @@ class DingTalkAdapter(BasePlatformAdapter):
             self.name,
             sender_nick,
             chat_id[:20] if chat_id else "?",
-            text[:80] if text else "(media)",
+            gateway_text[:80] if gateway_text else "(media)",
         )
         await self.handle_message(event)
+
+    def _gateway_text(
+        self,
+        text: str,
+        *,
+        message: "ChatbotMessage",
+        is_group: bool,
+    ) -> str:
+        """Expose an @-prefixed slash command without rewriting normal text."""
+        if not is_group or not self._message_mentions_bot(message):
+            return text
+        match = _MENTIONED_SLASH_COMMAND_RE.fullmatch(text or "")
+        return match.group("command").strip() if match else text
 
     @staticmethod
     def _extract_text(message: "ChatbotMessage") -> str:

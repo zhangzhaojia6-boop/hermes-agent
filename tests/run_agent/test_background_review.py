@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import run_agent as run_agent_module
 from run_agent import AIAgent
 
@@ -250,15 +252,26 @@ def test_background_review_installs_auto_deny_approval_callback(monkeypatch):
     )
 
 
-def test_background_review_summary_is_attributed_to_self_improvement_loop(monkeypatch):
-    """The CLI/gateway emission must identify the self-improvement loop.
+@pytest.mark.parametrize(
+    ("language", "prefix", "action"),
+    [
+        ("en", "💾 Self-improvement review:", "Memory updated"),
+        ("zh", "💾 自主改进复盘：", "已更新系统记忆。"),
+    ],
+)
+def test_background_review_summary_is_attributed_to_self_improvement_loop(
+    monkeypatch, language, prefix, action
+):
+    """The CLI/gateway emission identifies the localized review loop.
 
     Users who miss the line in their terminal have no way to tell that the
     background review was what modified their skill/memory stores. The
-    summary prefix ``💾 Self-improvement review: …`` makes the origin
-    explicit so both the CLI and gateway deliveries are unambiguous.
+    localized summary prefix makes the origin explicit so both the CLI
+    and gateway deliveries are unambiguous.
     """
     import json
+
+    monkeypatch.setenv("HERMES_LANGUAGE", language)
 
     captured_prints: list = []
     captured_bg_callback: list = []
@@ -303,12 +316,12 @@ def test_background_review_summary_is_attributed_to_self_improvement_loop(monkey
     # the self-improvement review explicitly.
     assert len(captured_prints) == 1, captured_prints
     printed = captured_prints[0]
-    assert "Self-improvement review" in printed, printed
-    assert "Memory updated" in printed, printed
+    assert prefix in printed, printed
+    assert action in printed, printed
 
     # Gateway path gets the same prefix.
     assert len(captured_bg_callback) == 1
-    assert captured_bg_callback[0].startswith("💾 Self-improvement review:"), (
+    assert captured_bg_callback[0].startswith(prefix), (
         captured_bg_callback[0]
     )
 
@@ -473,3 +486,13 @@ def test_skill_patch_off_silent_verbose_shows_diff():
     )
     assert len(verbose) == 1
     assert "demo" in verbose[0] and "→" in verbose[0]
+
+
+def test_skill_patch_on_is_chinese_when_language_is_chinese(monkeypatch):
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+
+    actions = summarize_background_review_actions(
+        _skill_patch_review(), [], notification_mode="on"
+    )
+
+    assert actions == ["已修改技能“demo”。"]

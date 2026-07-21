@@ -1256,6 +1256,51 @@ class TestExtractTextMentions:
     def test_dingtalk_in_platform_enum(self):
         assert Platform.DINGTALK.value == "dingtalk"
 
+    def test_structural_bot_mention_exposes_slash_command(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        message = MagicMock(is_in_at_list=True)
+
+        assert adapter._gateway_text(
+            "@鑫泰hermes  /sethome",
+            message=message,
+            is_group=True,
+        ) == "/sethome"
+        assert adapter._gateway_text(
+            "@鑫泰hermes /model gpt-5.6-sol",
+            message=message,
+            is_group=True,
+        ) == "/model gpt-5.6-sol"
+
+    def test_gateway_text_preserves_non_command_content(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        mentioned = MagicMock(is_in_at_list=True)
+        not_mentioned = MagicMock(is_in_at_list=False)
+
+        assert adapter._gateway_text(
+            "@鑫泰hermes 请解释 /sethome",
+            message=mentioned,
+            is_group=True,
+        ) == "@鑫泰hermes 请解释 /sethome"
+        assert adapter._gateway_text(
+            "contact alice@example.com /sethome",
+            message=mentioned,
+            is_group=True,
+        ) == "contact alice@example.com /sethome"
+        assert adapter._gateway_text(
+            "@鑫泰hermes /sethome",
+            message=not_mentioned,
+            is_group=True,
+        ) == "@鑫泰hermes /sethome"
+        assert adapter._gateway_text(
+            "@鑫泰hermes /sethome",
+            message=mentioned,
+            is_group=False,
+        ) == "@鑫泰hermes /sethome"
+
 
 # ---------------------------------------------------------------------------
 

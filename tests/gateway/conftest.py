@@ -32,6 +32,7 @@ incident.
 """
 
 import ast
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -329,6 +330,19 @@ def _scan_for_plugin_adapter_antipattern(source: str) -> list[str]:
     return offenses
 
 
+def _iter_gateway_test_paths() -> list[Path]:
+    """Return gateway test sources without traversing transient cache dirs."""
+    paths: list[Path] = []
+    for root, dirnames, filenames in os.walk(_GATEWAY_DIR, onerror=lambda _error: None):
+        dirnames[:] = sorted(name for name in dirnames if name != "__pycache__")
+        paths.extend(
+            Path(root) / name
+            for name in sorted(filenames)
+            if name.startswith("test_") and name.endswith(".py")
+        )
+    return paths
+
+
 def _fingerprint_gateway_tests() -> str:
     """Return a short fingerprint that changes when any gateway test file changes.
 
@@ -339,7 +353,7 @@ def _fingerprint_gateway_tests() -> str:
     import hashlib
 
     h = hashlib.sha256()
-    for path in sorted(_GATEWAY_DIR.rglob("test_*.py")):
+    for path in _iter_gateway_test_paths():
         try:
             st = path.stat()
             h.update(f"{path.name}:{st.st_mtime_ns}:{st.st_size}".encode())
@@ -354,7 +368,7 @@ def _run_adapter_antipattern_scan() -> list[str]:
     Returns a list of violation strings (empty if clean).
     """
     violations: list[str] = []
-    for path in _GATEWAY_DIR.rglob("test_*.py"):
+    for path in _iter_gateway_test_paths():
         if path.name in {"_plugin_adapter_loader.py", "conftest.py"}:
             continue
         try:
@@ -464,4 +478,3 @@ def pytest_configure(config):
             raise pytest.UsageError(msg)
         else:
             cache_file.write_text("clean", encoding="utf-8")
-
