@@ -23,6 +23,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from agent.i18n import get_language
 from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
@@ -478,6 +479,23 @@ def summarize_background_review_actions(
         is_skill = detail.get("tool") == "skill_manage"
 
         message_lower = message.lower()
+        if not verbose and get_language() == "zh":
+            if is_skill:
+                skill_name = str(detail.get("name") or "未命名技能")
+                if "created" in message_lower:
+                    actions.append(f"已创建技能“{skill_name}”。")
+                elif "patched" in message_lower:
+                    actions.append(f"已修改技能“{skill_name}”。")
+                else:
+                    actions.append(f"已更新技能“{skill_name}”。")
+            elif target == "user":
+                actions.append("已更新用户资料。")
+            elif target == "memory":
+                actions.append("已更新系统记忆。")
+            else:
+                actions.append("已完成自主改进。")
+            continue
+
         if not verbose:
             if "created" in message_lower:
                 actions.append(message)
@@ -898,15 +916,16 @@ def _run_review_in_thread(
 
         if actions:
             summary = " · ".join(dict.fromkeys(actions))
-            agent._safe_print(
-                f"  💾 Self-improvement review: {summary}"
+            notification = (
+                f"💾 自主改进复盘：{summary}"
+                if get_language() == "zh"
+                else f"💾 Self-improvement review: {summary}"
             )
+            agent._safe_print(f"  {notification}")
             _bg_cb = agent.background_review_callback
             if _bg_cb:
                 try:
-                    _bg_cb(
-                        f"💾 Self-improvement review: {summary}"
-                    )
+                    _bg_cb(notification)
                 except Exception:
                     pass
 

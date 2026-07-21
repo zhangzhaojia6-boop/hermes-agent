@@ -55,7 +55,7 @@ from typing import Callable, Dict, Optional, Any, List, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
-from agent.i18n import t
+from agent.i18n import get_language, t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -1297,6 +1297,24 @@ def _home_target_env_var(platform_name: str) -> str:
 def _home_thread_env_var(platform_name: str) -> str:
     """Return the optional thread/topic env var for a platform home target."""
     return f"{_home_target_env_var(platform_name)}_THREAD_ID"
+
+
+def _home_channel_missing_notice(platform_name: str, sethome_cmd: str) -> str:
+    """Render the first-contact home-channel notice in the active language."""
+    if get_language() == "zh":
+        return (
+            "📬 尚未设置默认回传频道。鑫泰铝业智能大脑会把定时任务结果"
+            "和跨平台消息发送到默认回传频道。\n\n"
+            f"输入 {sethome_cmd} 可将当前会话设为默认回传频道；"
+            "暂不设置也可以继续使用。"
+        )
+    return (
+        f"📬 No home channel is set for {platform_name.title()}. "
+        f"A home channel is where Hermes delivers cron job results "
+        f"and cross-platform messages.\n\n"
+        f"Type {sethome_cmd} to make this chat your home channel, "
+        f"or ignore to skip."
+    )
 
 
 def _restart_notification_pending() -> bool:
@@ -11610,13 +11628,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if source.platform == Platform.SLACK
                     else "/sethome"
                 )
-                notice = (
-                    f"📬 No home channel is set for {platform_name.title()}. "
-                    f"A home channel is where Hermes delivers cron job results "
-                    f"and cross-platform messages.\n\n"
-                    f"Type {sethome_cmd} to make this chat your home channel, "
-                    f"or ignore to skip."
-                )
+                notice = _home_channel_missing_notice(platform_name, sethome_cmd)
                 await self._deliver_platform_notice(source, notice)
         
         # -----------------------------------------------------------------

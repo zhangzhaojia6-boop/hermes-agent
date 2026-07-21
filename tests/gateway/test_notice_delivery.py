@@ -4,7 +4,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import SendResult
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _home_channel_missing_notice
 from gateway.session import SessionSource
 
 
@@ -30,6 +30,24 @@ def _make_runner(extra=None):
     adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True, message_id="private-1"))
     runner.adapters = {Platform.SLACK: adapter}
     return runner, adapter
+
+
+def test_home_channel_notice_is_chinese_when_runtime_language_is_chinese(monkeypatch):
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+
+    notice = _home_channel_missing_notice("dingtalk", "/sethome")
+
+    assert "默认回传频道" in notice
+    assert "/sethome" in notice
+    assert "No home channel" not in notice
+
+
+def test_home_channel_notice_preserves_english_default(monkeypatch):
+    monkeypatch.setenv("HERMES_LANGUAGE", "en")
+
+    notice = _home_channel_missing_notice("dingtalk", "/sethome")
+
+    assert "No home channel is set for Dingtalk" in notice
 
 
 @pytest.mark.asyncio
