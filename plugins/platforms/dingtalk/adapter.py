@@ -24,13 +24,16 @@ Configuration in config.yaml:
         extra:
           client_id: "your-app-key"      # or DINGTALK_CLIENT_ID env var
           client_secret: "your-secret"   # or DINGTALK_CLIENT_SECRET env var
+          xintai_outbox_relay: false      # route proactive sends through the audited Datahub outbox
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import time
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -1872,6 +1875,70 @@ class _IncomingHandler(
 # ──────────────────────────────────────────────────────────────────────────
 
 
+def _config_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+async def _send_via_xintai_outbox(
+    *,
+    httpx_module,
+    chat_id: str,
+    message: str,
+) -> dict[str, Any]:
+    base_url = os.getenv("XINTAI_DATAHUB_BASE_URL", "").strip()
+    relay_token = os.getenv("XINTAI_DINGTALK_STREAM_RELAY_TOKEN", "").strip()
+    if not base_url or not relay_token:
+        return {
+            "error": (
+                "Xintai Datahub outbox relay is not configured. "
+                "XINTAI_DATAHUB_BASE_URL and XINTAI_DINGTALK_STREAM_RELAY_TOKEN are required."
+            )
+        }
+
+    time_bucket = int(time.time() // 1800)
+    digest = hashlib.sha256(
+        f"{chat_id}\x1f{message}\x1f{time_bucket}".encode("utf-8")
+    ).hexdigest()
+    payload = {
+        "target_user_id": str(chat_id),
+        "title": XINTAI_RUNTIME_NAME,
+        "content": message,
+        "trace_id": f"hermes-outbound:{digest}",
+        "dedupe_key": f"hermes-outbound:{digest}",
+        "source_ref": "hermes_cron",
+    }
+    url = base_url.rstrip("/") + "/api/v1/hermes/outbound"
+    try:
+        async with httpx_module.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                url,
+                headers={"x-dingtalk-inbound-token": relay_token},
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+        if not isinstance(data, dict) or not bool(data.get("accepted") or data.get("success")):
+            return {"error": "Xintai Datahub outbox relay rejected the proactive message."}
+        return {
+            "success": True,
+            "platform": "dingtalk",
+            "chat_id": chat_id,
+            "status": data.get("status"),
+            "outbox_message_id": data.get("outbox_message_id"),
+            "duplicate": bool(data.get("duplicate")),
+        }
+    except Exception as exc:
+        clean_error = str(exc).replace(relay_token, "<redacted>")
+        try:
+            from tools.send_message_tool import _error as _redact_error
+
+            return _redact_error(f"Xintai Datahub outbox relay failed: {clean_error}")
+        except Exception:
+            return {"error": f"Xintai Datahub outbox relay failed: {clean_error}"}
+
+
 async def _standalone_send(
     pconfig,
     chat_id,
@@ -1881,19 +1948,26 @@ async def _standalone_send(
     media_files=None,
     force_document=False,
 ):
-    """Out-of-process DingTalk delivery via a static robot webhook URL.
+    """Out-of-process DingTalk delivery through Datahub or a robot webhook.
 
     Implements the standalone_sender_fn contract so deliver=dingtalk cron jobs
     succeed when cron runs separately from the gateway. The live adapter uses
     per-session webhook URLs from incoming messages, which aren't available
-    out-of-process; this path uses the static DINGTALK_WEBHOOK_URL / extra
-    webhook_url instead. Replaces the legacy _send_dingtalk helper.
+    out-of-process. When ``extra.xintai_outbox_relay`` is enabled, the message
+    is handed to the audited Datahub outbox. Other deployments retain the
+    static DINGTALK_WEBHOOK_URL / extra webhook_url behavior.
     """
     extra = getattr(pconfig, "extra", {}) or {}
     try:
         import httpx
     except ImportError:
         return {"error": "httpx not installed"}
+    if _config_bool(extra.get("xintai_outbox_relay")):
+        return await _send_via_xintai_outbox(
+            httpx_module=httpx,
+            chat_id=str(chat_id),
+            message=str(message),
+        )
     try:
         webhook_url = extra.get("webhook_url") or os.getenv("DINGTALK_WEBHOOK_URL", "")
         if not webhook_url:

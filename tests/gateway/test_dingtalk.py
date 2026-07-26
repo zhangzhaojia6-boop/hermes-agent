@@ -343,6 +343,80 @@ class TestSend:
         assert result.error and "do not support local file attachments" in result.error
 
 
+class TestStandaloneSend:
+
+    @pytest.mark.asyncio
+    async def test_xintai_relay_queues_through_datahub_outbox(self, monkeypatch):
+        import httpx
+        from plugins.platforms.dingtalk.adapter import _standalone_send
+
+        monkeypatch.setenv("XINTAI_DATAHUB_BASE_URL", "http://127.0.0.1:8000")
+        monkeypatch.setenv("XINTAI_DINGTALK_STREAM_RELAY_TOKEN", "relay-secret")
+
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "success": True,
+            "accepted": True,
+            "status": "sent",
+            "outbox_message_id": 42,
+        }
+        response.raise_for_status.return_value = None
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=response)
+        context = AsyncMock()
+        context.__aenter__.return_value = client
+        context.__aexit__.return_value = None
+        monkeypatch.setattr(httpx, "AsyncClient", MagicMock(return_value=context))
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={"xintai_outbox_relay": True},
+        )
+        result = await _standalone_send(
+            config,
+            "staff-user-001",
+            "今日事实核查已完成。",
+        )
+
+        assert result["success"] is True
+        assert result["outbox_message_id"] == 42
+        call = client.post.await_args
+        assert call.args[0] == "http://127.0.0.1:8000/api/v1/hermes/outbound"
+        assert call.kwargs["headers"]["x-dingtalk-inbound-token"] == "relay-secret"
+        assert call.kwargs["json"]["target_user_id"] == "staff-user-001"
+        assert call.kwargs["json"]["content"] == "今日事实核查已完成。"
+        assert call.kwargs["json"]["dedupe_key"].startswith("hermes-outbound:")
+
+    @pytest.mark.asyncio
+    async def test_xintai_relay_failure_does_not_fall_through_to_robot_webhook(self, monkeypatch):
+        import httpx
+        from plugins.platforms.dingtalk.adapter import _standalone_send
+
+        monkeypatch.setenv("XINTAI_DATAHUB_BASE_URL", "http://127.0.0.1:8000")
+        monkeypatch.setenv("XINTAI_DINGTALK_STREAM_RELAY_TOKEN", "relay-secret")
+        monkeypatch.setenv("DINGTALK_WEBHOOK_URL", "https://oapi.dingtalk.com/robot/send?access_token=secret")
+
+        request = httpx.Request("POST", "http://127.0.0.1:8000/api/v1/hermes/outbound")
+        response = httpx.Response(503, request=request, json={"detail": "temporarily unavailable"})
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=response)
+        context = AsyncMock()
+        context.__aenter__.return_value = client
+        context.__aexit__.return_value = None
+        monkeypatch.setattr(httpx, "AsyncClient", MagicMock(return_value=context))
+
+        result = await _standalone_send(
+            PlatformConfig(enabled=True, extra={"xintai_outbox_relay": True}),
+            "staff-user-001",
+            "不会走第二出口。",
+        )
+
+        assert "error" in result
+        assert client.post.await_count == 1
+        assert client.post.await_args.args[0].endswith("/api/v1/hermes/outbound")
+
+
 # ---------------------------------------------------------------------------
 # Connect / disconnect
 # ---------------------------------------------------------------------------
