@@ -4918,8 +4918,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
+        message: str = "",
     ) -> dict | None:
-        """Resolve reasoning effort for a session, honoring session overrides."""
+        """Resolve per-turn reasoning while honoring explicit session overrides."""
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
             try:
@@ -4930,7 +4931,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
-        return self._load_reasoning_config()
+
+        base_config = self._load_reasoning_config()
+        cfg = _load_gateway_runtime_config()
+        agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else {}
+        if not isinstance(agent_cfg, dict):
+            return base_config
+        adaptive_cfg = agent_cfg.get("adaptive_reasoning")
+        if not isinstance(adaptive_cfg, dict) or adaptive_cfg.get("enabled") is not True:
+            return base_config
+        if not message or self._message_requires_deep_reasoning(message):
+            return base_config
+
+        from hermes_constants import parse_reasoning_effort
+
+        fast_effort = adaptive_cfg.get("fast_effort", "high")
+        parsed = parse_reasoning_effort(fast_effort)
+        if parsed is None:
+            logger.warning(
+                "Unknown agent.adaptive_reasoning.fast_effort '%s'; using configured reasoning effort",
+                fast_effort,
+            )
+            return base_config
+        return parsed
+
+    @staticmethod
+    def _message_requires_deep_reasoning(message: str) -> bool:
+        """Keep ambiguous, operational, and evidence-heavy turns at full effort."""
+        text = str(message or "").strip().lower()
+        if not text:
+            return True
+
+        compact = re.sub(r"\s+", "", text)
+        if compact in {
+            "继续", "开始", "执行", "同意", "确认", "批准", "继续执行",
+            "继续完成", "下一步", "开始吧", "可以", "好的继续",
+        }:
+            return True
+
+        score = 0
+        if len(text) >= 80 or text.count("\n") >= 2:
+            score += 1
+        if any(token in text for token in ("```", "http://", "https://", "/api/", "\\", ".py", ".js", ".ts", ".sql")):
+            score += 1
+
+        operational_markers = (
+            "修改", "修复", "实现", "执行", "部署", "发布", "提交", "合并",
+            "删除", "配置", "安装", "登录", "同步", "回滚", "重启", "写入",
+            "导入", "导出", "发送", "创建", "更新", "优化", "接入",
+        )
+        evidence_markers = (
+            "分析", "规划", "对比", "原因", "架构", "全局", "验证", "验收",
+            "准确", "追溯", "事实", "异常", "日报", "产量", "库存", "能耗",
+            "开停机", "数据库", "生产机", "权限", "安全", "审计", "trace",
+        )
+        system_markers = ("hermes", "mes", "wms", "数据中枢", "钉钉", "数据库", "生产机", "git")
+
+        if any(marker in text for marker in operational_markers):
+            score += 2
+        if any(marker in text for marker in evidence_markers):
+            score += 2
+        if sum(marker in text for marker in system_markers) >= 2:
+            score += 2
+        if any(marker in text for marker in ("深入", "全面", "完整", "所有", "逐行", "最高", "绝对", "不允许")):
+            score += 2
+
+        return score >= 2
 
     def _set_session_reasoning_override(
         self,
@@ -13476,7 +13542,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
-            reasoning_config = self._resolve_session_reasoning_config(source=source)
+            reasoning_config = self._resolve_session_reasoning_config(
+                source=source,
+                message=prompt,
+            )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
@@ -18227,6 +18296,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
+                message=message,
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()

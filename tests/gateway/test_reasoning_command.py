@@ -227,6 +227,41 @@ class TestReasoningCommand:
 
         assert runner._resolve_session_reasoning_config(source=source) == {"enabled": True, "effort": "xhigh"}
 
+    @pytest.mark.parametrize(
+        ("message", "requires_deep"),
+        (
+            ("你好，在吗？", False),
+            ("今天几号？", False),
+            ("检查 MES、数据中枢和生产机链路，修复后部署并验收", True),
+            ("继续", True),
+        ),
+    )
+    def test_adaptive_reasoning_keeps_operational_turns_deep(self, message, requires_deep):
+        assert gateway_run.GatewayRunner._message_requires_deep_reasoning(message) is requires_deep
+
+    def test_adaptive_reasoning_uses_fast_effort_only_for_light_turns(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n"
+            "  reasoning_effort: max\n"
+            "  adaptive_reasoning:\n"
+            "    enabled: true\n"
+            "    fast_effort: high\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        runner = _make_runner()
+        assert runner._resolve_session_reasoning_config(message="你好，在吗？") == {
+            "enabled": True,
+            "effort": "high",
+        }
+        assert runner._resolve_session_reasoning_config(message="继续") == {
+            "enabled": True,
+            "effort": "max",
+        }
+
     def test_run_agent_reloads_reasoning_config_per_message(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
