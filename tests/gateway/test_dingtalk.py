@@ -1062,6 +1062,49 @@ def _make_gating_adapter(monkeypatch, *, extra=None, env=None):
 class TestAllowedUsersGate:
 
     @pytest.mark.asyncio
+    async def test_config_yaml_dm_allowlist_reaches_inbound_policy(self, monkeypatch, tmp_path):
+        from gateway.config import load_gateway_config
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("DINGTALK_ALLOWED_USERS", "*")
+        (tmp_path / "config.yaml").write_text(
+            """
+platforms:
+  dingtalk:
+    enabled: true
+    extra:
+      dm_allowed_users:
+        - owner-staff
+      require_mention: true
+      allowed_chats: []
+      free_response_chats: []
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        config = load_gateway_config()
+        adapter = DingTalkAdapter(config.platforms[Platform.DINGTALK])
+        adapter._running = True
+        adapter._accepting_events = True
+        adapter._schedule_xintai_relay = MagicMock()
+        adapter._resolve_media_codes = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        message = _FakeChatbotMessage.from_dict(
+            {
+                "msgId": "dm-config-yaml-1",
+                "conversationType": "1",
+                "senderId": "unlisted-user",
+                "senderStaffId": "unlisted-staff",
+                "text": {"content": "你好"},
+            }
+        )
+
+        await adapter._on_message(message)
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_unlisted_user_dm_is_not_dispatched(self, monkeypatch):
         from plugins.platforms.dingtalk.adapter import DingTalkAdapter
 
