@@ -1061,6 +1061,140 @@ def _make_gating_adapter(monkeypatch, *, extra=None, env=None):
 
 class TestAllowedUsersGate:
 
+    @pytest.mark.asyncio
+    async def test_unlisted_user_dm_is_not_dispatched(self, monkeypatch):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        adapter = DingTalkAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "allowed_users": ["*"],
+                    "dm_allowed_users": ["owner-staff", "assistant-staff"],
+                },
+            )
+        )
+        adapter._running = True
+        adapter._accepting_events = True
+        adapter._schedule_xintai_relay = MagicMock()
+        adapter._resolve_media_codes = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        message = _FakeChatbotMessage.from_dict(
+            {
+                "msgId": "dm-unlisted-1",
+                "conversationType": "1",
+                "senderId": "unlisted-user",
+                "senderStaffId": "unlisted-staff",
+                "text": {"content": "你好"},
+            }
+        )
+
+        await adapter._on_message(message)
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_listed_user_dm_is_dispatched(self, monkeypatch):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        adapter = DingTalkAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "allowed_users": ["*"],
+                    "dm_allowed_users": ["owner-staff", "assistant-staff"],
+                },
+            )
+        )
+        adapter._running = True
+        adapter._accepting_events = True
+        adapter._schedule_xintai_relay = MagicMock()
+        adapter._resolve_media_codes = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        message = _FakeChatbotMessage.from_dict(
+            {
+                "msgId": "dm-listed-1",
+                "conversationType": "1",
+                "senderId": "owner-user",
+                "senderStaffId": "owner-staff",
+                "text": {"content": "你好"},
+            }
+        )
+
+        await adapter._on_message(message)
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unlisted_user_group_mention_is_dispatched(self, monkeypatch):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        adapter = DingTalkAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "allowed_users": ["*"],
+                    "dm_allowed_users": ["owner-staff", "assistant-staff"],
+                    "require_mention": True,
+                },
+            )
+        )
+        adapter._running = True
+        adapter._accepting_events = True
+        adapter._schedule_xintai_relay = MagicMock()
+        adapter._resolve_media_codes = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        message = _FakeChatbotMessage.from_dict(
+            {
+                "msgId": "group-mentioned-1",
+                "conversationId": "any-group",
+                "conversationType": "2",
+                "senderId": "unlisted-user",
+                "senderStaffId": "unlisted-staff",
+                "isInAtList": True,
+                "text": {"content": "查询产量"},
+            }
+        )
+
+        await adapter._on_message(message)
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_group_without_mention_is_not_dispatched(self, monkeypatch):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+
+        adapter = DingTalkAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "allowed_users": ["*"],
+                    "dm_allowed_users": ["owner-staff", "assistant-staff"],
+                    "require_mention": True,
+                },
+            )
+        )
+        adapter._running = True
+        adapter._accepting_events = True
+        adapter._schedule_xintai_relay = MagicMock()
+        adapter._resolve_media_codes = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        message = _FakeChatbotMessage.from_dict(
+            {
+                "msgId": "group-unmentioned-1",
+                "conversationId": "any-group",
+                "conversationType": "2",
+                "senderId": "unlisted-user",
+                "senderStaffId": "unlisted-staff",
+                "isInAtList": False,
+                "text": {"content": "查询产量"},
+            }
+        )
+
+        await adapter._on_message(message)
+
+        adapter.handle_message.assert_not_awaited()
+
     def test_empty_allowlist_allows_everyone(self, monkeypatch):
         adapter = _make_gating_adapter(monkeypatch)
         assert adapter._is_user_allowed("anyone", "any-staff") is True

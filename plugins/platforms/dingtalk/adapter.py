@@ -269,6 +269,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         # not text parsing.
         self._mention_patterns: List[re.Pattern] = self._compile_mention_patterns()
         self._allowed_users: Set[str] = self._load_allowed_users()
+        self._dm_allowed_users: Set[str] = self._load_dm_allowed_users()
 
         self._stream_client: Any = None
         self._stream_task: Optional[asyncio.Task] = None
@@ -647,6 +648,21 @@ class DingTalkAdapter(BasePlatformAdapter):
         candidates.discard("")
         return bool(candidates & self._allowed_users)
 
+    def _load_dm_allowed_users(self) -> Set[str]:
+        raw = self.config.extra.get("dm_allowed_users") if self.config.extra else None
+        if isinstance(raw, list):
+            items = [str(part).strip() for part in raw if str(part).strip()]
+        else:
+            items = [part.strip() for part in str(raw or "").split(",") if part.strip()]
+        return {item.lower() for item in items}
+
+    def _is_dm_user_allowed(self, sender_id: str, sender_staff_id: str) -> bool:
+        if not self._dm_allowed_users:
+            return False
+        candidates = {(sender_id or "").lower(), (sender_staff_id or "").lower()}
+        candidates.discard("")
+        return bool(candidates & self._dm_allowed_users)
+
     def _message_mentions_bot(self, message: "ChatbotMessage") -> bool:
         """True if the bot was @-mentioned in a group message.
 
@@ -934,6 +950,9 @@ class DingTalkAdapter(BasePlatformAdapter):
                 "[%s] Dropping message from non-allowlisted user staff_id=%s sender_id=%s",
                 self.name, sender_staff_id, sender_id,
             )
+            return
+        if not is_group and not self._is_dm_user_allowed(sender_id, sender_staff_id):
+            logger.debug("[%s] Dropping unauthorized direct message", self.name)
             return
 
         # Group mention/pattern gate.  DMs pass through unconditionally.
