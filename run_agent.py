@@ -4429,7 +4429,10 @@ class AIAgent:
         )
 
         if base_url_host_matches(base_url, "openrouter.ai"):
-            self._client_kwargs["default_headers"] = build_or_headers()
+            headers = build_or_headers()
+            if is_truthy_value(os.getenv("HERMES_OPENROUTER_COMPAT_USER_AGENT")):
+                headers["User-Agent"] = "curl/8.7.1"
+            self._client_kwargs["default_headers"] = headers
         elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
             self._client_kwargs["default_headers"] = build_nvidia_nim_headers(base_url)
         elif base_url_host_matches(base_url, "api.routermint.com"):

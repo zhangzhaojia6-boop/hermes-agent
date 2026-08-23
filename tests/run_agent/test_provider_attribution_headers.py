@@ -25,6 +25,24 @@ def test_openrouter_base_url_applies_or_headers(mock_openai):
 
 
 @patch("run_agent.OpenAI")
+def test_openrouter_compat_user_agent_is_opt_in(mock_openai, monkeypatch):
+    monkeypatch.setenv("HERMES_OPENROUTER_COMPAT_USER_AGENT", "1")
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    agent._apply_client_headers_for_base_url("https://openrouter.ai/api/v1")
+
+    assert agent._client_kwargs["default_headers"]["User-Agent"] == "curl/8.7.1"
+
+
+@patch("run_agent.OpenAI")
 def test_routermint_base_url_applies_user_agent_header(mock_openai):
     mock_openai.return_value = MagicMock()
     agent = AIAgent(
