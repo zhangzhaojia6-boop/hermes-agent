@@ -71,6 +71,13 @@ from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
+
+def _force_non_streaming_for_endpoint(agent: Any) -> bool:
+    return (
+        env_var_enabled("HERMES_OPENROUTER_FORCE_NON_STREAMING")
+        and base_url_host_matches(str(agent.base_url or ""), "openrouter.ai")
+    )
+
 logger = logging.getLogger(__name__)
 
 # Stable prefix of the local interrupt status string emitted when a turn is
@@ -1286,7 +1293,10 @@ def run_conversation(
                 # Provider signaled "stream not supported" on a previous
                 # attempt — switch to non-streaming for the rest of this
                 # session instead of re-failing every retry.
-                if getattr(agent, "_disable_streaming", False):
+                if (
+                    getattr(agent, "_disable_streaming", False)
+                    or _force_non_streaming_for_endpoint(agent)
+                ):
                     _use_streaming = False
                 # CopilotACPClient communicates via subprocess stdio and
                 # returns a plain SimpleNamespace — not an iterable
