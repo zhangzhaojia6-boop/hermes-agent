@@ -54,6 +54,7 @@ def test_create_openai_client_no_proxy_when_env_unset(mock_openai, monkeypatch):
     http_client = mock_openai.call_args.kwargs.get("http_client")
     assert isinstance(http_client, httpx.Client)
     assert "HTTPProxy" not in _pool_types(http_client)
+    assert http_client._trust_env is False
     http_client.close()
 
 

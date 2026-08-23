@@ -231,4 +231,5 @@ def test_create_openai_client_bypasses_proxy_for_no_proxy_host(mock_openai, monk
     assert "HTTPProxy" not in pool_types, (
         "NO_PROXY host must not route through HTTPProxy; pools were %r" % (pool_types,)
     )
+    assert http_client._trust_env is False
     http_client.close()

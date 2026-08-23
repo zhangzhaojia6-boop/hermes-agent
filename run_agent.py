@@ -3992,6 +3992,7 @@ class AIAgent:
                 proxy=_proxy,
                 mounts=_mounts or None,
                 verify=verify,
+                trust_env=_proxy is not None,
             )
         except Exception:
             return None
