@@ -73,9 +73,14 @@ from utils import base_url_host_matches, env_var_enabled
 
 
 def _force_non_streaming_for_endpoint(agent: Any) -> bool:
+    base_url = str(agent.base_url or "").rstrip("/")
+    configured_openrouter_url = os.getenv("OPENROUTER_BASE_URL", "").strip().rstrip("/")
     return (
         env_var_enabled("HERMES_OPENROUTER_FORCE_NON_STREAMING")
-        and base_url_host_matches(str(agent.base_url or ""), "openrouter.ai")
+        and (
+            base_url_host_matches(base_url, "openrouter.ai")
+            or bool(configured_openrouter_url and base_url == configured_openrouter_url)
+        )
     )
 
 logger = logging.getLogger(__name__)
